@@ -202,9 +202,9 @@ void loop() {
         display.println("Button1 pushed");
         display.print("IO_1 HIGH");        
         display.display();
-        digitalWrite(IO_1, HIGH);
+        digitalWrite(LED_1, HIGH);
         delay(1000);
-        digitalWrite(IO_1, LOW);
+        digitalWrite(LED_1, LOW);
         display.display();
         delay(1000);
         display.clearDisplay();

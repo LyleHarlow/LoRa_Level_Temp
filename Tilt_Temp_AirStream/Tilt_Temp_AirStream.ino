@@ -14,8 +14,8 @@ char ver3[] =      "8 samples/50 ms loop" ;
 
 //Libraries for DS18B20 sensor
 #include <OneWire.h>
-byte temp1 = 25 ;
-byte temp2 = 13 ;
+byte temp1 = 13 ;
+byte temp2 = 25 ;
 
 byte button = 17 ; // pushbutton I/O pin
 
@@ -46,7 +46,8 @@ Adafruit_MPU6050 mpu;
 Adafruit_SSD1306 display(128, 64, &Wire, OLED_RST);
 // Adafruit_SSD1306 display = Adafruit_SSD1306(128, 64, &Wire);
 
-const int MPU_addr=0x68;
+// const int MPU_addr=0x68; // Typical Address
+const int MPU_addr=0x69; // Moved to allow other device at 0x68
 int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
  
 int minVal=265;
@@ -579,4 +580,3 @@ int result ;
 	return result ;
 	
 } // ----------------- end of dallas() -------------------
-
