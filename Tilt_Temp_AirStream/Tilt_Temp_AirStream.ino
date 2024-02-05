@@ -6,7 +6,7 @@ char ver[] =       "ver 1.1  12/31/22 " ;
 char ver2[] =      "Tilt + 2 Temps" ;
 char ver3[] =      "8 samples/50 ms loop" ;
 
-#include <Adafruit_MPU6050.h>
+#include <Adafruit_MPU6050.h> // use "" to specify that it should look for and be found in this sketch folder - not the libraries folder
 
 //Libraries for LoRa
 #include <SPI.h>
@@ -376,7 +376,7 @@ void change_mode() {
 // --------------------------- Tilt() ---------------------------
 void Tilt() { // get the tilt x,y (left/right, up/down) angle data 
   
-    Wire.beginTransmission(MPU_addr);
+  Wire.beginTransmission(MPU_addr);
 	Wire.write(0x3B);
 	Wire.endTransmission(false);
 	Wire.requestFrom(MPU_addr,14,true);
@@ -387,8 +387,8 @@ void Tilt() { // get the tilt x,y (left/right, up/down) angle data
 	int yAng = map(AcY,minVal,maxVal,-90,90);
 	int zAng = map(AcZ,minVal,maxVal,-90,90);
 
-int	x = 5729.6 * (atan2(-yAng, -zAng)+PI);
-int	y = 5730 * (atan2(-xAng, -zAng)+PI);	 
+  int	x = 5729.6 * (atan2(-yAng, -zAng)+PI);
+  int	y = 5730 * (atan2(-xAng, -zAng)+PI);	 
 //	x = RAD_TO_DEG * (atan2(-yAng, -zAng)+PI);
 //	y = RAD_TO_DEG * (atan2(-xAng, -zAng)+PI);
 	// z= RAD_TO_DEG * (atan2(-yAng, -xAng)+PI);
