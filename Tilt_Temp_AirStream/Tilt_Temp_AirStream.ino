@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:11 PDT
+// Last updated: 2026-07-25 09:22 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -161,7 +161,7 @@ int tiltSampleIndex = 0;
 unsigned long lastTransmitTime = 0;
 const unsigned long TRANSMIT_INTERVAL_MS = 2000;
 
-BUTTON zeroLevelButton = {"Zero Level", 260, 210, 100, 40};
+BUTTON zeroLevelButton = {"Zero Level", 0, 0, 110, 32};  // position set in drawInfoScreenLayout(), once display space bounds are known
 
 // ---------------------------------------------------------------------------------
 //                                     Setup
@@ -405,27 +405,37 @@ void transmitPacket()
 // ---------------------------------------------------------------------------------
 
 const int VALUE_COLUMN_X = 170;
-const int LINE_HEIGHT = 26;
-const int FIRST_LINE_Y = 40;
+const int LINE_HEIGHT = 22;
+
+// Set once in drawInfoScreenLayout() from ui.displaySpaceTopY (which depends
+// on the title bar's actual height), reused by drawValueField() so the two
+// stay in sync instead of guessing pixel offsets independently.
+int firstLineY = 0;
 
 void drawInfoScreenLayout()
 {
   ui.drawTitleBar("Airstream Monitor");
   ui.clearDisplaySpace();
 
+  firstLineY = ui.displaySpaceTopY + 6;
+
   const char *labels[] = {"Nose Up/Down", "Left Up/Down", "Fridge", "Freezer", "Inside AS", "DC Cabinet", "Light"};
   for (int i = 0; i < 7; i++)
   {
-    ui.lcdSetCursorXY(10, FIRST_LINE_Y + i * LINE_HEIGHT);
+    ui.lcdSetCursorXY(ui.displaySpaceLeftX + 6, firstLineY + i * LINE_HEIGHT);
     ui.lcdPrint(labels[i]);
   }
 
+  // Anchored to the bottom-right of the display space so it can't overlap
+  // the label/value rows above, regardless of exact screen/title bar size.
+  zeroLevelButton.centerX = ui.displaySpaceRightX - zeroLevelButton.width / 2 - 6;
+  zeroLevelButton.centerY = ui.displaySpaceBottomY - zeroLevelButton.height / 2 - 6;
   ui.drawButton(zeroLevelButton);
 }
 
 void drawValueField(int lineIndex, const char *text)
 {
-  int y = FIRST_LINE_Y + lineIndex * LINE_HEIGHT;
+  int y = firstLineY + lineIndex * LINE_HEIGHT;
   ui.lcdDrawFilledRectangle(VALUE_COLUMN_X, y, 120, ui.lcdGetFontHeightWithDecenders(), LCD_BLACK);
   ui.lcdSetCursorXY(VALUE_COLUMN_X, y);
   ui.lcdPrint(text);
