@@ -5,6 +5,14 @@
 
 #include <Arduino.h>
 
+// Some ESP32 core versions don't expose PROGMEM to plain .c translation
+// units (Arduino.h's pgmspace.h pull-in appears to be C++-only there),
+// even though .cpp files see it fine. PROGMEM is a no-op on ESP32 anyway
+// (flash is memory-mapped, unlike AVR), so an empty fallback is safe.
+#ifndef PROGMEM
+#define PROGMEM
+#endif
+
 
 #if defined(ARDUINO_ARCH_RP2040)
   extern const byte UI_Font_9[];
