@@ -57,7 +57,7 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
 
 ## Known bugs in Heltec ESP32 Dev-Boards v2.1.7 (needed for Tilt_Temp_TowVehc)
 
-Two real upstream bugs in this library needed local patches to work with this project's
+Three real upstream bugs in this library needed local patches to work with this project's
 toolchain (GCC 14, from Heltec's ESP32 core 3.3.8 board package) and board (WiFi LoRa 32 V2).
 
 **This library is gitignored** (Library Manager installs aren't tracked in this repo), so
@@ -92,4 +92,31 @@ In `heltec.cpp`, change the constructor's `#if` from:
 to:
 ```c
 #if defined( Class_Wifi_Kit ) || defined( Class_WIFI_LORA )
+```
+
+### 3. Blank OLED, no errors anywhere: wrong constructor argument order
+
+Even after fix #2, the OLED stayed completely blank (not even a brief flash of Heltec's
+own boot splash), despite Serial showing every init call "succeeding." Cause:
+`SSD1306Wire`'s constructor in `src/HT_SSD1306Wire.h` is
+`(uint8_t address, uint32_t freq, int sda, int scl, DISPLAY_GEOMETRY g, int8_t rst)`, but
+`heltec.cpp`'s constructor calls it as `SSD1306Wire(0x3c, SDA_OLED, SCL_OLED, RST_OLED,
+GEOMETRY_128_64)` -- 5 positional args matching an older 5-arg signature (before `freq` was
+apparently inserted as the 2nd parameter). That silently puts `SDA_OLED` into `freq`,
+`SCL_OLED` into `sda`, and `RST_OLED` into `scl` -- so `Wire.begin()` runs on the wrong
+physical pins entirely at a ~4Hz clock, while the real reset pin never gets passed at all.
+Nothing in this path checks I2C ACKs, so every call reports success while nothing ever
+reaches the actual display.
+
+In `heltec.cpp`, change both `SSD1306Wire` constructor calls from:
+```c
+display = new SSD1306Wire(0x3c, SDA_OLED, SCL_OLED, RST_OLED, GEOMETRY_128_64);
+...
+display = new SSD1306Wire(0x3c, SDA_OLED, SCL_OLED, RST_OLED, GEOMETRY_64_32);
+```
+to:
+```c
+display = new SSD1306Wire(0x3c, 400000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_OLED);
+...
+display = new SSD1306Wire(0x3c, 400000, SDA_OLED, SCL_OLED, GEOMETRY_64_32, RST_OLED);
 ```
