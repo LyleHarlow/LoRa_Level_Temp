@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:27 PDT
+// Last updated: 2026-07-25 09:32 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -432,7 +432,28 @@ void drawInfoScreenLayout()
   // the label/value rows above, regardless of exact screen/title bar size.
   zeroLevelButton.centerX = ui.displaySpaceRightX - zeroLevelButton.width / 2 - 6;
   zeroLevelButton.centerY = ui.displaySpaceBottomY - zeroLevelButton.height / 2 - 6;
+
+  // TEMPORARY DIAGNOSTIC for the stack-smashing crash in ui.drawButton().
+  Serial.print("displaySpace: left=");
+  Serial.print(ui.displaySpaceLeftX);
+  Serial.print(" right=");
+  Serial.print(ui.displaySpaceRightX);
+  Serial.print(" top=");
+  Serial.print(ui.displaySpaceTopY);
+  Serial.print(" bottom=");
+  Serial.println(ui.displaySpaceBottomY);
+  Serial.print("zeroLevelButton: centerX=");
+  Serial.print(zeroLevelButton.centerX);
+  Serial.print(" centerY=");
+  Serial.print(zeroLevelButton.centerY);
+  Serial.print(" width=");
+  Serial.print(zeroLevelButton.width);
+  Serial.print(" height=");
+  Serial.println(zeroLevelButton.height);
+  Serial.println("Calling ui.drawButton()...");
+
   ui.drawButton(zeroLevelButton);
+  Serial.println("ui.drawButton() returned");
 }
 
 void drawValueField(int lineIndex, const char *text)
