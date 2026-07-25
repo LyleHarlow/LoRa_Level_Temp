@@ -16,10 +16,10 @@
 // GPIO21, which on this board is TOUCH_CS. Manual SPI/LoRa setup below
 // avoids that conflict.
 //
-// IMPORTANT: the tilt axis mapping below is an UNVERIFIED PLACEHOLDER.
-// Run AxisOrientationTest.ino on the physically (vertically) mounted board
-// first and correct PITCH_FROM_AXES / ROLL_FROM_AXES / PITCH_SIGN /
-// ROLL_SIGN to match what you observe. See the comment block below.
+// NOTE: the tilt axis formulas below (PITCH_FROM_AXES / ROLL_FROM_AXES) were
+// derived from running AxisOrientationTest.ino on the physically mounted
+// board. PITCH_SIGN/ROLL_SIGN still need a quick real-world check -- see
+// the comment block below.
 //
 
 #include <Arduino.h>
@@ -85,15 +85,21 @@ const int OUT2_RELAY_PIN = 32;
 // I/O-1 (GPIO23) is a spare pin on the connector, unused for now
 
 // ---------------------------------------------------------------------------------
-//                          Tilt axis mapping -- UNVERIFIED, see header comment
+//                          Tilt axis mapping -- derived from AxisOrientationTest.ino
 // ---------------------------------------------------------------------------------
-// Run AxisOrientationTest.ino on the physically-mounted board, tilt the nose
-// up/down and watch which of angleFromXZ/YZ/XY moves (and which direction),
-// then do the same for left up/down. Update the two macros and two signs
-// below to match. As shipped these are just a starting guess (XZ->pitch,
-// YZ->roll) and are very likely wrong for a vertically-mounted board.
-#define PITCH_FROM_AXES(ax, ay, az) (atan2((ax), (az)) * 180.0 / PI)  // nose up(+)/down(-)
-#define ROLL_FROM_AXES(ax, ay, az) (atan2((ay), (az)) * 180.0 / PI)   // left up(+)/down(-)
+// Empirically determined on the physically (vertically) mounted board:
+//  - left up/down tracks atan2(ax, ay), reading 90 deg at level -- so
+//    subtracting 90 deg gives a clean "0 = level" roll value.
+//  - nose up/down tracks raw Z acceleration; atan2(az, sqrt(ax^2+ay^2)) is
+//    the equivalent robust angle (stays linear in degrees across the full
+//    range, unlike raw Z which flattens out near +-90 deg).
+//
+// Sign (+/- direction) has NOT been verified yet -- raise the nose and
+// confirm "Nose Up/Down" reads positive on the info screen (flip
+// PITCH_SIGN to -1.0 if backwards); do the same for the left side and
+// ROLL_SIGN.
+#define PITCH_FROM_AXES(ax, ay, az) (atan2((az), sqrt((ax) * (ax) + (ay) * (ay))) * 180.0 / PI)  // nose up(+)/down(-)
+#define ROLL_FROM_AXES(ax, ay, az) ((atan2((ax), (ay)) * 180.0 / PI) - 90.0)                      // left up(+)/down(-)
 const float PITCH_SIGN = 1.0;
 const float ROLL_SIGN = 1.0;
 
