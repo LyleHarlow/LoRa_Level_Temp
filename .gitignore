@@ -50,3 +50,10 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Third-party libraries installed via Arduino Library Manager. The
+# sketchbook location points at this repo's root (see README), so
+# Library Manager installs land in libraries/ alongside our own vendored
+# TouchUserInterfaceForArduino -- only that one is ours to track.
+libraries/*
+!libraries/TouchUserInterfaceForArduino/
