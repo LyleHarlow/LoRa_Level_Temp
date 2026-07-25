@@ -54,3 +54,20 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
   which the previous version of this sketch never explicitly handled).
 - Temp probes are BOJACK DS18B20 (1M stainless, OneWire) -- one per pin, each with its own
   bus and pull-up resistor (the schematic's 3.3k), not a shared bus.
+
+## Known toolchain issue: Heltec ESP32 Dev-Boards v2.1.7 fails to compile on GCC 14
+
+`libraries/Heltec_ESP32_Dev-Boards/src/driver/sx1276.c` calls `SpiInOut()` without a
+prototype in scope (the equivalent `sx1262-board.c` has one; `sx1276.c` is just missing
+it upstream). Older GCC only warned about this; GCC 14 (the toolchain Heltec's ESP32 core
+3.3.8 board package ships) makes it a hard error by default, so `Tilt_Temp_TowVehc` won't
+compile against a fresh install of this library without a one-line fix.
+
+**This library is gitignored** (Library Manager installs aren't tracked in this repo), so
+the fix below needs to be reapplied any time the library is freshly installed/updated:
+
+Add this line near the top of `sx1276.c` (after the existing `extern void lora_printf(...)`
+declaration works as a landmark):
+```c
+extern uint8_t SpiInOut(Spi_t *obj, uint8_t outData);
+```
