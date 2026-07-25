@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:48 PDT
+// Last updated: 2026-07-25 10:44 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -225,6 +225,20 @@ void setup()
   // only needs to reach the tow vehicle (tens of feet), so a much lower
   // power is plenty; raise it if range testing shows it's needed.
   LoRa.setTxPower(2);
+
+  // IMPORTANT: these must exactly match Tilt_Temp_TowVehc's radio settings
+  // or the two boards can't decode each other's packets at all -- with no
+  // error on either side, just silence. This bit us once already: this
+  // library (sandeepmistry/LoRa) leaves these at the SX1276 chip's
+  // power-on defaults (SF7, sync word 0x12) unless set explicitly, while
+  // TowVehicle's Heltec-vendored LoRa library sets different values
+  // (SF11, sync word 0x34) inside its own begin(). Setting them explicitly
+  // here, matching TowVehicle, rather than relying on either library's
+  // implicit defaults staying the same or matching each other.
+  LoRa.setSpreadingFactor(11);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setSyncWord(0x34);
+  LoRa.enableCrc();
 
   Serial.println("Calling ui.begin()...");
   ui.begin(LCD_CS_PIN, LCD_DC_PIN, TOUCH_CS_PIN, LCD_ORIENTATION_LANDSCAPE_4PIN_LEFT, UI_Font_13_Bold);

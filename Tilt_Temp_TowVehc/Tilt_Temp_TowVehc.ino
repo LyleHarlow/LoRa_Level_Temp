@@ -92,6 +92,17 @@ void setup()
   // definitions for this board variant.
   Heltec.begin(true, true, true, true, LORA_BAND);
 
+  // IMPORTANT: these must exactly match Tilt_Temp_AirStream's radio
+  // settings or the two boards can't decode each other's packets at all --
+  // with no error on either side, just silence (this bit us once already).
+  // Heltec.begin() already sets these same values internally today, but
+  // setting them explicitly here means this sketch doesn't silently break
+  // if that library's defaults ever change.
+  Heltec.LoRa.setSpreadingFactor(11);
+  Heltec.LoRa.setSignalBandwidth(125E3);
+  Heltec.LoRa.setSyncWord(0x34);
+  Heltec.LoRa.enableCrc();
+
   Serial.println();
   Serial.println(this_file);
   Serial.println(ver);
@@ -131,14 +142,39 @@ void loop()
 void receiveLoRaPacket()
 {
   int packetSize = Heltec.LoRa.parsePacket();
+  if (packetSize == 0)
+  {
+    return;  // nothing arrived, not an error -- don't spam Serial
+  }
   if (packetSize != sizeof(rxPacket))
   {
+    // Something arrived but isn't a valid LoRaPacket -- radio params
+    // mismatched between boards, interference, or a version skew between
+    // the two sketches' LoRaPacket.h. Worth knowing about, unlike the
+    // silent "nothing arrived" case above.
+    Serial.print("RX: got ");
+    Serial.print(packetSize);
+    Serial.print(" bytes, expected ");
+    Serial.println(sizeof(rxPacket));
     return;
   }
 
   Heltec.LoRa.readBytes((uint8_t *)&rxPacket, sizeof(rxPacket));
   lastPacketTime = millis();
   alertMuted = false;  // a fresh, valid packet clears any prior mute
+
+  Serial.print("RX  pitch=");
+  Serial.print(rxPacket.pitch, 1);
+  Serial.print("  roll=");
+  Serial.print(rxPacket.roll, 1);
+  Serial.print("  t1=");
+  Serial.print(rxPacket.temp1, 1);
+  Serial.print("  t2=");
+  Serial.print(rxPacket.temp2, 1);
+  Serial.print("  t3=");
+  Serial.print(rxPacket.temp3, 1);
+  Serial.print("  t4=");
+  Serial.println(rxPacket.temp4, 1);
 
   digitalWrite(LED1_PIN, HIGH);
   delay(30);
