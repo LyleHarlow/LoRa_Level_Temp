@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:22 PDT
+// Last updated: 2026-07-25 09:27 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -83,7 +83,9 @@ const int TEMP1_PIN = 13;  // Fridge
 const int TEMP2_PIN = 25;  // Freezer
 const int TEMP3_PIN = 36;  // Inside Airstream
 const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter
-const int AMBLIGHTSENSE_PIN = 37;
+// AMBLIGHTSENSE_PIN = 37, disabled -- photoresistor isn't installed yet, and
+// (separately) analogRead() on this pin was crashing the ADC driver anyway.
+// Re-enable once the sensor is physically installed and that's investigated.
 
 // Relay -- originally for a fridge cooling fan, no longer needed (fridge is
 // now self-cooling 12VDC). Held off; reserved for a future over-temp alarm.
@@ -419,8 +421,8 @@ void drawInfoScreenLayout()
 
   firstLineY = ui.displaySpaceTopY + 6;
 
-  const char *labels[] = {"Nose Up/Down", "Left Up/Down", "Fridge", "Freezer", "Inside AS", "DC Cabinet", "Light"};
-  for (int i = 0; i < 7; i++)
+  const char *labels[] = {"Nose Up/Down", "Left Up/Down", "Fridge", "Freezer", "Inside AS", "DC Cabinet"};
+  for (int i = 0; i < 6; i++)
   {
     ui.lcdSetCursorXY(ui.displaySpaceLeftX + 6, firstLineY + i * LINE_HEIGHT);
     ui.lcdPrint(labels[i]);
@@ -463,13 +465,4 @@ void drawInfoScreenValues()
 
   snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp4);
   drawValueField(5, buf);
-
-  // analogRead(AMBLIGHTSENSE_PIN) is disabled -- it crashes with a
-  // divide-by-zero deep in the ESP-IDF ADC driver (confirmed via a
-  // symbolized crash backtrace: adc_oneshot_read -> adc_oneshot_hal_convert
-  // -> adc_oneshot_ll_get_event). GPIO37 is one of the pins flagged early on
-  // as possibly not fully bonded out on this module -- needs hardware
-  // investigation (try analogSetPinAttenuation(), or move the sensor to a
-  // different GPIO) before re-enabling.
-  drawValueField(6, "N/A");
 }
