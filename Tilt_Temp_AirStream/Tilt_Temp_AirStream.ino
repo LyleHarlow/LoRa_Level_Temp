@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:43 PDT
+// Last updated: 2026-07-25 09:48 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -155,9 +155,12 @@ LoRaPacket txPacket;
 float pitchOffset = 0;
 float rollOffset = 0;
 
+// Smoothing averages the raw accelerometer vector (not the derived angles)
+// -- averaging angles directly breaks near the atan2 wraparound point.
 const int TILT_SAMPLE_COUNT = 8;
-float pitchSamples[TILT_SAMPLE_COUNT];
-float rollSamples[TILT_SAMPLE_COUNT];
+float axSamples[TILT_SAMPLE_COUNT];
+float aySamples[TILT_SAMPLE_COUNT];
+float azSamples[TILT_SAMPLE_COUNT];
 int tiltSampleIndex = 0;
 
 unsigned long lastTransmitTime = 0;
@@ -232,8 +235,9 @@ void setup()
 
   for (int i = 0; i < TILT_SAMPLE_COUNT; i++)
   {
-    pitchSamples[i] = 0;
-    rollSamples[i] = 0;
+    axSamples[i] = 0;
+    aySamples[i] = 0;
+    azSamples[i] = 0;
   }
 
   drawInfoScreenLayout();
@@ -306,24 +310,24 @@ void updateTilt()
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
-  float ax = accel.acceleration.x;
-  float ay = accel.acceleration.y;
-  float az = accel.acceleration.z;
-
-  pitchSamples[tiltSampleIndex] = PITCH_SIGN * PITCH_FROM_AXES(ax, ay, az);
-  rollSamples[tiltSampleIndex] = ROLL_SIGN * ROLL_FROM_AXES(ax, ay, az);
+  axSamples[tiltSampleIndex] = accel.acceleration.x;
+  aySamples[tiltSampleIndex] = accel.acceleration.y;
+  azSamples[tiltSampleIndex] = accel.acceleration.z;
   tiltSampleIndex = (tiltSampleIndex + 1) % TILT_SAMPLE_COUNT;
 
-  float pitchSum = 0;
-  float rollSum = 0;
+  float axAvg = 0, ayAvg = 0, azAvg = 0;
   for (int i = 0; i < TILT_SAMPLE_COUNT; i++)
   {
-    pitchSum += pitchSamples[i];
-    rollSum += rollSamples[i];
+    axAvg += axSamples[i];
+    ayAvg += aySamples[i];
+    azAvg += azSamples[i];
   }
+  axAvg /= TILT_SAMPLE_COUNT;
+  ayAvg /= TILT_SAMPLE_COUNT;
+  azAvg /= TILT_SAMPLE_COUNT;
 
-  float pitchDegrees = (pitchSum / TILT_SAMPLE_COUNT) - pitchOffset;
-  float rollDegrees = (rollSum / TILT_SAMPLE_COUNT) - rollOffset;
+  float pitchDegrees = PITCH_SIGN * PITCH_FROM_AXES(axAvg, ayAvg, azAvg) - pitchOffset;
+  float rollDegrees = ROLL_SIGN * ROLL_FROM_AXES(axAvg, ayAvg, azAvg) - rollOffset;
 
   if (LEVEL_POINT_DISTANCE_INCHES > 0)
   {
@@ -432,28 +436,7 @@ void drawInfoScreenLayout()
   // the label/value rows above, regardless of exact screen/title bar size.
   zeroLevelButton.centerX = ui.displaySpaceRightX - zeroLevelButton.width / 2 - 6;
   zeroLevelButton.centerY = ui.displaySpaceBottomY - zeroLevelButton.height / 2 - 6;
-
-  // TEMPORARY DIAGNOSTIC for the stack-smashing crash in ui.drawButton().
-  Serial.print("displaySpace: left=");
-  Serial.print(ui.displaySpaceLeftX);
-  Serial.print(" right=");
-  Serial.print(ui.displaySpaceRightX);
-  Serial.print(" top=");
-  Serial.print(ui.displaySpaceTopY);
-  Serial.print(" bottom=");
-  Serial.println(ui.displaySpaceBottomY);
-  Serial.print("zeroLevelButton: centerX=");
-  Serial.print(zeroLevelButton.centerX);
-  Serial.print(" centerY=");
-  Serial.print(zeroLevelButton.centerY);
-  Serial.print(" width=");
-  Serial.print(zeroLevelButton.width);
-  Serial.print(" height=");
-  Serial.println(zeroLevelButton.height);
-  Serial.println("Calling ui.drawButton()...");
-
   ui.drawButton(zeroLevelButton);
-  Serial.println("ui.drawButton() returned");
 }
 
 void drawValueField(int lineIndex, const char *text)
@@ -466,13 +449,10 @@ void drawValueField(int lineIndex, const char *text)
 
 void drawInfoScreenValues()
 {
-  char buf[32];
+  char buf[24];
   const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
 
-  // TEMPORARY DIAGNOSTIC: append uptime seconds, which must visibly tick
-  // every second regardless of sensor values -- proves whether this
-  // function is actually running/redrawing at all.
-  snprintf(buf, sizeof(buf), "%.1f %s (%lus)", txPacket.pitch, unit, millis() / 1000);
+  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.pitch, unit);
   drawValueField(0, buf);
 
   snprintf(buf, sizeof(buf), "%.1f %s", txPacket.roll, unit);
