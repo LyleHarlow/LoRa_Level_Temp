@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:10 PDT
+// Last updated: 2026-07-25 09:09 PDT
 
 //
 // Standalone diagnostic for the Airstream board's touchscreen. Talks to
@@ -25,7 +25,9 @@
 
 const int LCD_CS_PIN = 2;
 const int LCD_DC_PIN = 17;
-const int LCD_RST_PIN = 33;
+// LCD_RESET is jumpered to the LED_RST net (GPIO16), not LCD_RST (GPIO33) --
+// GPIO33 isn't actually connected to the panel's reset pin on this board.
+const int LCD_RST_PIN = 16;
 const int LCD_BACKLIGHT_PIN = 12;
 
 const int SPI_SCK_PIN = 5;

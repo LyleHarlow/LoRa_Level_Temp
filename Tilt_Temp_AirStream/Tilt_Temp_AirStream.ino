@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 08:59 PDT
+// Last updated: 2026-07-25 09:09 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -65,7 +65,12 @@ const long LORA_BAND = 915E6;
 // Touchscreen / LCD (ILI9341 + XPT2046)
 const int LCD_CS_PIN = 2;
 const int LCD_DC_PIN = 17;
-const int LCD_RST_PIN = 33;
+// LCD_RESET is jumpered to the LED_RST net (GPIO16), not the LCD_RST net
+// (GPIO33) -- GPIO33 isn't actually connected to the panel's reset pin on
+// this board. Confirmed by the user; previously used GPIO33 here, which
+// left the real reset pin floating and was very likely why the display
+// never showed anything.
+const int LCD_RST_PIN = 16;
 const int LCD_BACKLIGHT_PIN = 12;
 const int TOUCH_CS_PIN = 21;
 // TOUCH_IRQ_PIN (GPIO38) is on the schematic but not currently used by the library
