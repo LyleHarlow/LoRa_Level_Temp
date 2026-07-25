@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 08:44 PDT
+// Last updated: 2026-07-25 08:59 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -401,9 +401,7 @@ void transmitPacket()
   Serial.print("  t3=");
   Serial.print(txPacket.temp3, 1);
   Serial.print("  t4=");
-  Serial.print(txPacket.temp4, 1);
-  Serial.print("  light=");
-  Serial.println(analogRead(AMBLIGHTSENSE_PIN));
+  Serial.println(txPacket.temp4, 1);
 }
 
 // ---------------------------------------------------------------------------------
@@ -460,6 +458,12 @@ void drawInfoScreenValues()
   snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp4);
   drawValueField(5, buf);
 
-  snprintf(buf, sizeof(buf), "%d", analogRead(AMBLIGHTSENSE_PIN));
-  drawValueField(6, buf);
+  // analogRead(AMBLIGHTSENSE_PIN) is disabled -- it crashes with a
+  // divide-by-zero deep in the ESP-IDF ADC driver (confirmed via a
+  // symbolized crash backtrace: adc_oneshot_read -> adc_oneshot_hal_convert
+  // -> adc_oneshot_ll_get_event). GPIO37 is one of the pins flagged early on
+  // as possibly not fully bonded out on this module -- needs hardware
+  // investigation (try analogSetPinAttenuation(), or move the sensor to a
+  // different GPIO) before re-enabling.
+  drawValueField(6, "N/A");
 }
