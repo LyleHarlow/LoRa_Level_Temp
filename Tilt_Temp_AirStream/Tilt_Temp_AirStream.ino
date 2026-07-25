@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 10:52 PDT
+// Last updated: 2026-07-25 12:11 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -30,6 +30,7 @@
 #include <EEPROM.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <RTClib.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <LoRa.h>
@@ -46,10 +47,16 @@ char ver[] = "ver 2.1  " __DATE__;
 // See the Confirmed Hardware section of the plan for how these were derived
 // (schematic + the user's own Heltec pinout spreadsheet).
 
-// I2C -- MPU6050 (RTC deferred, not wired up in this version)
+// I2C -- MPU6050 and PCF8523 RTC share this bus at different addresses.
+// MPU6050_ADDRESS is jumpered to 0x69 (ADO tied to 3.3V) specifically to
+// stay clear of the PCF8523's fixed 0x68 -- both devices work fine
+// together as long as Wire.begin() is only called once (here) and each
+// library's begin() is passed that same already-configured &Wire, rather
+// than letting a library call its own Wire.begin() with default pins.
 const int SDA_PIN = 4;
 const int SCL_PIN = 15;
-const int MPU6050_ADDRESS = 0x69;  // ADO jumpered to 3.3V; keeps clear of PCF8523 RTC's fixed 0x68
+const int MPU6050_ADDRESS = 0x69;
+const int PCF8523_ADDRESS = 0x68;  // fixed by the chip, not configurable
 
 // SPI -- shared with the onboard LoRa radio; each device has its own CS
 const int SPI_SCK_PIN = 5;
@@ -131,6 +138,8 @@ const unsigned long TEMP_CONVERSION_TIME_MS = 750;
 // ---------------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
+RTC_PCF8523 rtc;
+bool rtcAvailable = false;
 TouchUserInterfaceForArduino ui;
 
 OneWire oneWireTemp1(TEMP1_PIN);
@@ -190,6 +199,8 @@ void setup()
 
   setupTiltSensor();
   Serial.println("Tilt sensor init done");
+  setupRTC();
+  Serial.println("RTC init done");
   setupTempSensors();
   Serial.println("Temp sensors init done");
 
@@ -269,6 +280,48 @@ void setupTiltSensor()
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+// Shares the Wire bus Wire.begin(SDA_PIN, SCL_PIN) already set up in
+// setupTiltSensor() -- passing &Wire here reuses that, rather than the RTC
+// library calling its own Wire.begin() with default pins. MPU6050 (0x69)
+// and this RTC (fixed 0x68) coexist fine as two independent I2C devices.
+void setupRTC()
+{
+  if (!rtc.begin(&Wire))
+  {
+    Serial.print("PCF8523 RTC not found at 0x");
+    Serial.println(PCF8523_ADDRESS, HEX);
+    rtcAvailable = false;
+    return;
+  }
+
+  rtcAvailable = true;
+
+  if (!rtc.initialized() || rtc.lostPower())
+  {
+    // First boot, or the battery was disconnected/died -- fall back to
+    // this sketch's compile time. Not accurate, but better than nothing;
+    // replace with rtc.adjust(DateTime(...)) for a real time if needed.
+    Serial.println("RTC lost power or uninitialized -- setting to compile time");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  rtc.start();
+
+  DateTime now = rtc.now();
+  Serial.print("RTC time: ");
+  Serial.print(now.year());
+  Serial.print('-');
+  Serial.print(now.month());
+  Serial.print('-');
+  Serial.print(now.day());
+  Serial.print(' ');
+  Serial.print(now.hour());
+  Serial.print(':');
+  Serial.print(now.minute());
+  Serial.print(':');
+  Serial.println(now.second());
 }
 
 void setupTempSensors()
@@ -417,7 +470,22 @@ void transmitPacket()
   Serial.print("  t3=");
   Serial.print(txPacket.temp3, 1);
   Serial.print("  t4=");
-  Serial.println(txPacket.temp4, 1);
+  Serial.print(txPacket.temp4, 1);
+
+  // Ongoing proof the RTC keeps working alongside the MPU6050 over time,
+  // not just at boot -- watch this tick forward every transmit alongside
+  // normal tilt/temp readings.
+  if (rtcAvailable)
+  {
+    DateTime now = rtc.now();
+    Serial.print("  rtc=");
+    Serial.print(now.hour());
+    Serial.print(':');
+    Serial.print(now.minute());
+    Serial.print(':');
+    Serial.print(now.second());
+  }
+  Serial.println();
 }
 
 // ---------------------------------------------------------------------------------

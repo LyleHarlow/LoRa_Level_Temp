@@ -5,8 +5,9 @@ Code and Hardware Repo for LoRa Level and Temp Project
 Two Heltec WiFi LoRa 32 V2 boards for monitoring an Airstream travel trailer:
 
 - **Airstream** (`Tilt_Temp_AirStream/`) rides on the trailer. Reads tilt (MPU6050) for
-  leveling and 4 DS18B20 temperature probes (fridge, freezer, inside the trailer, DC
-  electrical cabinet), shows them on a touchscreen, and transmits them over LoRa.
+  leveling, 4 DS18B20 temperature probes (fridge, freezer, inside the trailer, DC
+  electrical cabinet), and a PCF8523 RTC, shows them on a touchscreen, and transmits them
+  over LoRa.
 - **TowVehicle** (`Tilt_Temp_TowVehc/`) rides in the cab. Receives that data over LoRa and
   shows it on its built-in OLED; 4 buttons cycle screens and mute the link-lost alert.
 
@@ -26,6 +27,7 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
      (see Known hardware notes below for why `Tilt_Temp_AirStream` doesn't use it)
    - `Adafruit MPU6050`
    - `Adafruit Unified Sensor` (MPU6050 dependency)
+   - `RTClib` (by Adafruit)
    - `Adafruit GFX Library`
    - `Adafruit ILI9341`
    - `XPT2046_Touchscreen` (by Paul Stoffregen)
@@ -42,8 +44,12 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
 ## Known hardware notes
 
 - MPU6050 address is 0x69 (ADO jumpered to 3.3V) so it doesn't collide with the PCF8523
-  RTC's fixed 0x68 address -- this was the root cause of an earlier "RTC and MPU6050 don't
-  work when both are plugged in" issue.
+  RTC's fixed 0x68 address -- this was part of the root cause of an earlier "RTC and MPU6050
+  don't work when both are plugged in" issue (the rest was likely the old code testing
+  against a PCF8563-oriented library/example for a different chip than the actual PCF8523
+  hardware). Both now share one I2C bus fine: `Wire.begin(SDA_PIN, SCL_PIN)` is called once
+  in `setupTiltSensor()`, and each library's `begin()` is passed that same `&Wire` rather
+  than being allowed to call its own `Wire.begin()` with default pins.
 - The Airstream board's LCD/touchscreen SPI bus is intentionally shared with the onboard
   LoRa radio's SPI pins (SCK/MISO/MOSI), each device has its own CS pin.
 - `Tilt_Temp_AirStream` intentionally does NOT use the `Heltec ESP32 Dev-Boards` library.
