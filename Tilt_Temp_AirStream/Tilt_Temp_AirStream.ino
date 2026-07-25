@@ -194,6 +194,12 @@ void setup()
   {
     Serial.println("Starting LoRa failed!");
   }
+  // LoRa.begin() defaults to 17dBm via PA_BOOST, which draws a real current
+  // spike (~100mA+) on transmit -- enough to visibly sag the shared 3.3V
+  // rail and flicker the LCD without tripping a brownout reset. This link
+  // only needs to reach the tow vehicle (tens of feet), so a much lower
+  // power is plenty; raise it if range testing shows it's needed.
+  LoRa.setTxPower(2);
 
   ui.begin(LCD_CS_PIN, LCD_DC_PIN, TOUCH_CS_PIN, LCD_ORIENTATION_LANDSCAPE_4PIN_LEFT, UI_Font_13_Bold);
 
