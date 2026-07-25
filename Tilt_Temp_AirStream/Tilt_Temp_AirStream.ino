@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:09 PDT
+// Last updated: 2026-07-25 09:11 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -224,15 +224,6 @@ void setup()
   Serial.println("Calling ui.begin()...");
   ui.begin(LCD_CS_PIN, LCD_DC_PIN, TOUCH_CS_PIN, LCD_ORIENTATION_LANDSCAPE_4PIN_LEFT, UI_Font_13_Bold);
   Serial.println("ui.begin() returned");
-
-  // TEMPORARY DIAGNOSTIC: simplest possible thing the LCD driver can do --
-  // fill the whole screen red. If this doesn't show up either, the problem
-  // is fundamental SPI/wiring/init, not anything specific to the menu/label
-  // drawing code. Remove once the blank-screen issue is resolved.
-  Serial.println("Diagnostic: filling screen red...");
-  ui.lcdClearScreen(LCD_RED);
-  delay(2000);
-  Serial.println("Diagnostic fill done");
 
   pitchOffset = ui.readConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, 0);
   rollOffset = ui.readConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, 0);
