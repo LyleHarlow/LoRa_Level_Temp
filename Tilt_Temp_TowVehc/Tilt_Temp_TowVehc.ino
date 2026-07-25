@@ -5,30 +5,43 @@
 //      ******************************************************************
 
 //
-// Heltec WiFi LoRa 32 V2. Receives tilt/temp data from the Airstream board
-// over LoRa and shows it on the built-in OLED. Buttons cycle between
-// screens; see ../hardware for schematics and
-// C:\Users\Harlow\.claude\plans\cozy-sauteeing-whale.md for the full plan
-// this was built from.
+// Heltec WiFi LoRa 32 V2, built on Heltec's own board package + Heltec_ESP32
+// library (https://github.com/HelTecAutomation/Heltec_ESP32) rather than
+// raw ESP32 core + separate display/LoRa libraries. Heltec.begin() powers
+// up the module's Vext rail, inits the built-in OLED, and inits the LoRa
+// radio using the board package's own pin definitions -- no manual
+// SPI/Wire/pin setup needed for those.
+//
+// Board package: https://resource.heltec.cn/download/package_heltec_esp32_index.json
+// Select board "Heltec WiFi LoRa 32(V2)".
+//
+// Receives tilt/temp data from the Airstream board over LoRa and shows it
+// on the built-in OLED. Buttons cycle between screens; see ../hardware for
+// schematics and C:\Users\Harlow\.claude\plans\cozy-sauteeing-whale.md for
+// the full plan this was built from.
+//
+// NOTE: the Airstream board intentionally does NOT use this library --
+// Heltec's board package fixes Vext to GPIO21, which on the Airstream
+// board is TOUCH_CS. Heltec.begin() unconditionally drives Vext, which
+// would conflict with the touchscreen's chip-select. TowVehicle doesn't
+// use GPIO21 for anything, so no conflict here.
 //
 
-#include <Arduino.h>
-#include <SPI.h>
-#include <Wire.h>
-#include <string.h>
-#include <LoRa.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include "heltec.h"
 #include "LoRaPacket.h"
 
 char this_file[] = "Tilt_Temp_TowVehc";
-char ver[] = "ver 2.1  " __DATE__;
+char ver[] = "ver 2.2  " __DATE__;
+
+const long LORA_BAND = 915E6;
 
 // ---------------------------------------------------------------------------------
 //                                    Pin definitions
 // ---------------------------------------------------------------------------------
-// See the Confirmed Hardware section of the plan for how these were derived
-// from the corrected schematic.
+// OLED, LoRa radio, and Vext pins come from the board package (via
+// Heltec.begin()) and don't need to be defined here. These are the custom
+// pins specific to this carrier board -- see the Confirmed Hardware
+// section of the plan for how they were derived from the schematic.
 
 const int BUTTON1_PIN = 17;  // previous screen
 const int BUTTON2_PIN = 39;  // next screen
@@ -38,25 +51,7 @@ const int BUTTON4_PIN = 12;  // spare (logged to Serial only for now)
 const int LED1_PIN = 2;   // heartbeat: brief flash on each received packet
 const int LED2_PIN = 32;  // alert: solid on when the LoRa link is lost
 
-// Built-in OLED (standard Heltec WiFi LoRa 32 V2 wiring)
-const int OLED_SDA_PIN = 4;
-const int OLED_SCL_PIN = 15;
-const int OLED_RST_PIN = 16;
-const int SCREEN_WIDTH = 128;
-const int SCREEN_HEIGHT = 64;
-
-// LoRa radio (standard Heltec WiFi LoRa 32 V2 pins)
-const int SPI_SCK_PIN = 5;
-const int SPI_MISO_PIN = 19;
-const int SPI_MOSI_PIN = 27;
-const int LORA_CS_PIN = 18;
-const int LORA_RST_PIN = 14;
-const int LORA_DIO0_PIN = 26;
-const long LORA_BAND = 915E6;
-
 // ---------------------------------------------------------------------------------
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST_PIN);
 
 LoRaPacket rxPacket;
 unsigned long lastPacketTime = 0;
@@ -91,8 +86,12 @@ DebouncedButton buttons[4] = {
 
 void setup()
 {
-  Serial.begin(115200);
-  delay(100);
+  // Heltec.begin(DisplayEnable, LoRaEnable, SerialEnable, PABOOST, BAND) --
+  // handles Serial.begin(), Vext power-up, OLED init, and LoRa radio init
+  // (SPI + pins) all in one call, using the board package's own pin
+  // definitions for this board variant.
+  Heltec.begin(true, true, true, true, LORA_BAND);
+
   Serial.println();
   Serial.println(this_file);
   Serial.println(ver);
@@ -106,33 +105,9 @@ void setup()
   digitalWrite(LED1_PIN, LOW);
   digitalWrite(LED2_PIN, LOW);
 
-  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-  {
-    Serial.println("SSD1306 allocation failed");
-    while (1)
-      delay(1000);
-  }
-  display.setTextColor(SSD1306_WHITE);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println(this_file);
-  display.println(ver);
-  display.display();
-
-  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
-  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
-  if (!LoRa.begin(LORA_BAND))
-  {
-    Serial.println("Starting LoRa failed!");
-    display.println("LoRa init failed!");
-    display.display();
-  }
-
   memset(&rxPacket, 0, sizeof(rxPacket));
 
-  delay(1500);
+  delay(1000);
   drawScreen();
 }
 
@@ -155,13 +130,13 @@ void loop()
 
 void receiveLoRaPacket()
 {
-  int packetSize = LoRa.parsePacket();
+  int packetSize = Heltec.LoRa.parsePacket();
   if (packetSize != sizeof(rxPacket))
   {
     return;
   }
 
-  LoRa.readBytes((uint8_t *)&rxPacket, sizeof(rxPacket));
+  Heltec.LoRa.readBytes((uint8_t *)&rxPacket, sizeof(rxPacket));
   lastPacketTime = millis();
   alertMuted = false;  // a fresh, valid packet clears any prior mute
 
@@ -220,49 +195,50 @@ void handleButtons()
 
 void drawScreen()
 {
-  display.clearDisplay();
-  display.setCursor(0, 0);
+  Heltec.display->clear();
+  Heltec.display->setFont(ArialMT_Plain_10);
+  Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
+
+  char line[32];
 
   switch (currentScreen)
   {
   case SCREEN_LEVEL:
-    display.println("Level");
-    display.print("Nose: ");
-    display.print(rxPacket.pitch, 1);
-    display.println();
-    display.print("Left: ");
-    display.print(rxPacket.roll, 1);
+    Heltec.display->drawString(0, 0, "Level");
+    snprintf(line, sizeof(line), "Nose: %.1f", rxPacket.pitch);
+    Heltec.display->drawString(0, 16, line);
+    snprintf(line, sizeof(line), "Left: %.1f", rxPacket.roll);
+    Heltec.display->drawString(0, 32, line);
     break;
 
   case SCREEN_TEMPS:
-    display.println("Temps (F)");
-    display.print("Fridge  ");
-    display.println(rxPacket.temp1, 1);
-    display.print("Freezer ");
-    display.println(rxPacket.temp2, 1);
-    display.print("Inside  ");
-    display.println(rxPacket.temp3, 1);
-    display.print("DC Cab  ");
-    display.println(rxPacket.temp4, 1);
+    Heltec.display->drawString(0, 0, "Temps (F)");
+    snprintf(line, sizeof(line), "Fridge  %.1f", rxPacket.temp1);
+    Heltec.display->drawString(0, 14, line);
+    snprintf(line, sizeof(line), "Freezer %.1f", rxPacket.temp2);
+    Heltec.display->drawString(0, 27, line);
+    snprintf(line, sizeof(line), "Inside  %.1f", rxPacket.temp3);
+    Heltec.display->drawString(0, 40, line);
+    snprintf(line, sizeof(line), "DC Cab  %.1f", rxPacket.temp4);
+    Heltec.display->drawString(0, 53, line);
     break;
 
   case SCREEN_LINK:
-    display.println("LoRa Link");
+    Heltec.display->drawString(0, 0, "LoRa Link");
     if (lastPacketTime == 0)
     {
-      display.println("No packet yet");
+      Heltec.display->drawString(0, 16, "No packet yet");
     }
     else
     {
-      display.print("Last packet: ");
-      display.print((millis() - lastPacketTime) / 1000);
-      display.println("s ago");
-      display.println(isLinkLost() ? "LINK LOST" : "OK");
+      snprintf(line, sizeof(line), "Last: %lus ago", (millis() - lastPacketTime) / 1000);
+      Heltec.display->drawString(0, 16, line);
+      Heltec.display->drawString(0, 29, isLinkLost() ? "LINK LOST" : "OK");
     }
-    display.print("RSSI: ");
-    display.println(LoRa.packetRssi());
+    snprintf(line, sizeof(line), "RSSI: %d", Heltec.LoRa.packetRssi());
+    Heltec.display->drawString(0, 42, line);
     break;
   }
 
-  display.display();
+  Heltec.display->display();
 }

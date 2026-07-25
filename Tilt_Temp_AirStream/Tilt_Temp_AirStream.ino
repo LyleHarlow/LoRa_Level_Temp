@@ -5,11 +5,16 @@
 //      ******************************************************************
 
 //
-// Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 NTC-thermistor temps,
-// shows them on the ILI9341 touchscreen, and transmits them to the
+// Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
+// probes, shows them on the ILI9341 touchscreen, and transmits them to the
 // TowVehicle board over LoRa. See ../hardware for schematics and
 // C:\Users\Harlow\.claude\plans\cozy-sauteeing-whale.md for the full plan
 // this was built from.
+//
+// This board intentionally does NOT use Heltec's Heltec_ESP32 library
+// (unlike Tilt_Temp_TowVehc) -- that library's Vext handling claims
+// GPIO21, which on this board is TOUCH_CS. Manual SPI/LoRa setup below
+// avoids that conflict.
 //
 // IMPORTANT: the tilt axis mapping below is an UNVERIFIED PLACEHOLDER.
 // Run AxisOrientationTest.ino on the physically (vertically) mounted board
@@ -23,6 +28,8 @@
 #include <EEPROM.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <LoRa.h>
 #include <TouchUserInterfaceForArduino.h>
 #include <UI_Fonts.h>
@@ -61,14 +68,14 @@ const int LCD_BACKLIGHT_PIN = 12;
 const int TOUCH_CS_PIN = 21;
 // TOUCH_IRQ_PIN (GPIO38) is on the schematic but not currently used by the library
 
-// Sensors. TEMP1/TEMP2 are on ESP32's ADC2, which the WiFi radio also uses --
-// reads can be unreliable while WiFi is active (LoRa/SPI/I2C are unaffected).
-// Not a concern today since this sketch doesn't use WiFi, but worth knowing
-// if that ever changes (e.g. adding OTA updates).
-const int TEMP1_PIN = 13;  // Fridge (ADC2)
-const int TEMP2_PIN = 25;  // Freezer (ADC2)
-const int TEMP3_PIN = 36;  // Inside Airstream (ADC1)
-const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter (ADC1)
+// Sensors. TEMP1-4 are each a DS18B20 (BOJACK 1M stainless probe) on its
+// own OneWire bus, with the schematic's 3.3k resistor acting as the
+// OneWire pull-up (matches the original code's OneWire-based approach on
+// these same physical pins, just swapped between TEMP1/TEMP2).
+const int TEMP1_PIN = 13;  // Fridge
+const int TEMP2_PIN = 25;  // Freezer
+const int TEMP3_PIN = 36;  // Inside Airstream
+const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter
 const int AMBLIGHTSENSE_PIN = 37;
 
 // Relay -- originally for a fridge cooling fan, no longer needed (fridge is
@@ -100,19 +107,34 @@ const float LEVEL_POINT_DISTANCE_INCHES = 0;
 const int EEPROM_ADDR_PITCH_OFFSET = 0;
 const int EEPROM_ADDR_ROLL_OFFSET = 10;
 
-// NTC thermistor conversion (3.3k series resistor, NTC to ground -- see
-// schematic). NOMINAL_RESISTANCE/B_COEFFICIENT are common 10k-NTC defaults
-// and are UNVERIFIED against the actual probe part; raw ADC counts are
-// printed to Serial to make calibrating these easier.
-const float SERIES_RESISTOR = 3300.0;
-const float NOMINAL_RESISTANCE = 10000.0;
-const float NOMINAL_TEMPERATURE_C = 25.0;
-const float B_COEFFICIENT = 3950.0;
+// DS18B20 conversion timing (~750ms at default 12-bit resolution). Reads
+// are done as a non-blocking request-then-collect cycle so they don't
+// stall the tilt-sampling/touch loop.
+const unsigned long TEMP_UPDATE_INTERVAL_MS = 2000;
+const unsigned long TEMP_CONVERSION_TIME_MS = 750;
 
 // ---------------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
 TouchUserInterfaceForArduino ui;
+
+OneWire oneWireTemp1(TEMP1_PIN);
+OneWire oneWireTemp2(TEMP2_PIN);
+OneWire oneWireTemp3(TEMP3_PIN);
+OneWire oneWireTemp4(TEMP4_PIN);
+DallasTemperature dsTemp1(&oneWireTemp1);
+DallasTemperature dsTemp2(&oneWireTemp2);
+DallasTemperature dsTemp3(&oneWireTemp3);
+DallasTemperature dsTemp4(&oneWireTemp4);
+
+enum TempReadState
+{
+  TEMP_IDLE,
+  TEMP_CONVERTING
+};
+TempReadState tempReadState = TEMP_IDLE;
+unsigned long tempConversionStartTime = 0;
+unsigned long lastTempUpdateTime = 0;
 
 LoRaPacket txPacket;
 float pitchOffset = 0;
@@ -149,6 +171,7 @@ void setup()
   digitalWrite(OUT2_RELAY_PIN, LOW);
 
   setupTiltSensor();
+  setupTempSensors();
 
   pinMode(LCD_RST_PIN, OUTPUT);
   digitalWrite(LCD_RST_PIN, HIGH);
@@ -192,6 +215,21 @@ void setupTiltSensor()
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+void setupTempSensors()
+{
+  dsTemp1.begin();
+  dsTemp2.begin();
+  dsTemp3.begin();
+  dsTemp4.begin();
+
+  // non-blocking mode: requestTemperatures() returns immediately, we poll
+  // for the result ourselves after TEMP_CONVERSION_TIME_MS (see updateTemperatures)
+  dsTemp1.setWaitForConversion(false);
+  dsTemp2.setWaitForConversion(false);
+  dsTemp3.setWaitForConversion(false);
+  dsTemp4.setWaitForConversion(false);
 }
 
 // ---------------------------------------------------------------------------------
@@ -267,34 +305,41 @@ void updateTilt()
 //                                 Temperature sensing
 // ---------------------------------------------------------------------------------
 
-float readThermistorTempF(int pin)
+float readDS18B20(DallasTemperature &sensor)
 {
-  int adc = analogRead(pin);
-  float voltageRatio = (float)adc / 4095.0;
-
-  if (voltageRatio <= 0.001 || voltageRatio >= 0.999)
+  float f = sensor.getTempFByIndex(0);
+  if (f == DEVICE_DISCONNECTED_F)
   {
-    return NAN;  // probe likely open or shorted
+    return NAN;  // probe missing or wiring fault
   }
-
-  float resistance = SERIES_RESISTOR * voltageRatio / (1.0 - voltageRatio);
-
-  float steinhart = resistance / NOMINAL_RESISTANCE;
-  steinhart = log(steinhart);
-  steinhart /= B_COEFFICIENT;
-  steinhart += 1.0 / (NOMINAL_TEMPERATURE_C + 273.15);
-  steinhart = 1.0 / steinhart;
-  steinhart -= 273.15;  // deg C
-
-  return steinhart * 9.0 / 5.0 + 32.0;
+  return f;
 }
 
+// Non-blocking: kicks off a conversion on all 4 probes every
+// TEMP_UPDATE_INTERVAL_MS, then collects the results once conversion time
+// has elapsed. Does not delay() -- safe to call every loop iteration.
 void updateTemperatures()
 {
-  txPacket.temp1 = readThermistorTempF(TEMP1_PIN);
-  txPacket.temp2 = readThermistorTempF(TEMP2_PIN);
-  txPacket.temp3 = readThermistorTempF(TEMP3_PIN);
-  txPacket.temp4 = readThermistorTempF(TEMP4_PIN);
+  unsigned long now = millis();
+
+  if (tempReadState == TEMP_IDLE && now - lastTempUpdateTime >= TEMP_UPDATE_INTERVAL_MS)
+  {
+    dsTemp1.requestTemperatures();
+    dsTemp2.requestTemperatures();
+    dsTemp3.requestTemperatures();
+    dsTemp4.requestTemperatures();
+    tempConversionStartTime = now;
+    tempReadState = TEMP_CONVERTING;
+  }
+  else if (tempReadState == TEMP_CONVERTING && now - tempConversionStartTime >= TEMP_CONVERSION_TIME_MS)
+  {
+    txPacket.temp1 = readDS18B20(dsTemp1);
+    txPacket.temp2 = readDS18B20(dsTemp2);
+    txPacket.temp3 = readDS18B20(dsTemp3);
+    txPacket.temp4 = readDS18B20(dsTemp4);
+    lastTempUpdateTime = now;
+    tempReadState = TEMP_IDLE;
+  }
 }
 
 // ---------------------------------------------------------------------------------
