@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 10:44 PDT
+// Last updated: 2026-07-25 10:52 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -424,7 +424,7 @@ void transmitPacket()
 //                                    Display
 // ---------------------------------------------------------------------------------
 
-const int VALUE_COLUMN_X = 170;
+const int VALUE_COLUMN_X = 140;
 const int LINE_HEIGHT = 22;
 
 // Set once in drawInfoScreenLayout() from ui.displaySpaceTopY (which depends
@@ -439,7 +439,7 @@ void drawInfoScreenLayout()
 
   firstLineY = ui.displaySpaceTopY + 6;
 
-  const char *labels[] = {"Nose Up/Down", "Left Up/Down", "Fridge", "Freezer", "Inside AS", "DC Cabinet"};
+  const char *labels[] = {"Front to Back", "Left/Right", "Fridge", "Freezer", "Inside AS", "DC Cabinet"};
   for (int i = 0; i < 6; i++)
   {
     ui.lcdSetCursorXY(ui.displaySpaceLeftX + 6, firstLineY + i * LINE_HEIGHT);
@@ -456,20 +456,30 @@ void drawInfoScreenLayout()
 void drawValueField(int lineIndex, const char *text)
 {
   int y = firstLineY + lineIndex * LINE_HEIGHT;
-  ui.lcdDrawFilledRectangle(VALUE_COLUMN_X, y, 120, ui.lcdGetFontHeightWithDecenders(), LCD_BLACK);
+  ui.lcdDrawFilledRectangle(VALUE_COLUMN_X, y, 170, ui.lcdGetFontHeightWithDecenders(), LCD_BLACK);
   ui.lcdSetCursorXY(VALUE_COLUMN_X, y);
   ui.lcdPrint(text);
+}
+
+// Formats a signed tilt value as a direction word + magnitude, e.g.
+// "Nose High 2.3 deg" instead of a signed number -- easier to act on at a
+// glance. Unit switches to inches once LEVEL_POINT_DISTANCE_INCHES is set.
+void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *positiveLabel, const char *negativeLabel)
+{
+  const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
+  const char *direction = (value >= 0) ? positiveLabel : negativeLabel;
+  float magnitude = (value >= 0) ? value : -value;
+  snprintf(buf, bufSize, "%s %.1f %s", direction, magnitude, unit);
 }
 
 void drawInfoScreenValues()
 {
   char buf[24];
-  const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
 
-  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.pitch, unit);
+  formatDirectionalValue(buf, sizeof(buf), txPacket.pitch, "Nose High", "Nose Low");
   drawValueField(0, buf);
 
-  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.roll, unit);
+  formatDirectionalValue(buf, sizeof(buf), txPacket.roll, "Left High", "Right High");
   drawValueField(1, buf);
 
   snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp1);

@@ -4,6 +4,8 @@
 //      *                                                                *
 //      ******************************************************************
 
+// Last updated: 2026-07-25 10:52 PDT
+
 //
 // Heltec WiFi LoRa 32 V2, built on Heltec's own board package + Heltec_ESP32
 // library (https://github.com/HelTecAutomation/Heltec_ESP32) rather than
@@ -229,6 +231,19 @@ void handleButtons()
 //                                    Display
 // ---------------------------------------------------------------------------------
 
+// Formats a signed tilt value as a direction word + magnitude, e.g.
+// "Nose High 2.3 deg" instead of a signed number -- matches
+// Tilt_Temp_AirStream's touchscreen wording. Unit is hardcoded to degrees
+// for now since rxPacket doesn't carry which unit Airstream used -- when
+// Airstream's LEVEL_POINT_DISTANCE_INCHES gets set to switch to inches,
+// this needs updating too (or LoRaPacket needs a unit flag added).
+void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *positiveLabel, const char *negativeLabel)
+{
+  const char *direction = (value >= 0) ? positiveLabel : negativeLabel;
+  float magnitude = (value >= 0) ? value : -value;
+  snprintf(buf, bufSize, "%s %.1f deg", direction, magnitude);
+}
+
 void drawScreen()
 {
   Heltec.display->clear();
@@ -241,10 +256,10 @@ void drawScreen()
   {
   case SCREEN_LEVEL:
     Heltec.display->drawString(0, 0, "Level");
-    snprintf(line, sizeof(line), "Nose: %.1f", rxPacket.pitch);
-    Heltec.display->drawString(0, 16, line);
-    snprintf(line, sizeof(line), "Left: %.1f", rxPacket.roll);
-    Heltec.display->drawString(0, 32, line);
+    formatDirectionalValue(line, sizeof(line), rxPacket.pitch, "Nose High", "Nose Low");
+    Heltec.display->drawString(0, 20, line);
+    formatDirectionalValue(line, sizeof(line), rxPacket.roll, "Left High", "Right High");
+    Heltec.display->drawString(0, 40, line);
     break;
 
   case SCREEN_TEMPS:
