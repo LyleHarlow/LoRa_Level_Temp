@@ -4,6 +4,8 @@
 //      *                                                                *
 //      ******************************************************************
 
+// Last updated: 2026-07-25 08:44 PDT
+
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
 // probes, shows them on the ILI9341 touchscreen, and transmits them to the
@@ -177,10 +179,19 @@ void setup()
   digitalWrite(OUT2_RELAY_PIN, LOW);
 
   setupTiltSensor();
+  Serial.println("Tilt sensor init done");
   setupTempSensors();
+  Serial.println("Temp sensors init done");
 
+  // Proper hardware reset pulse (LOW then HIGH) rather than just driving
+  // HIGH -- the ILI9341 driver also does its own software reset since we
+  // don't pass this pin to its constructor, but a clean hardware reset
+  // first can't hurt and rules out a bad power-on state.
   pinMode(LCD_RST_PIN, OUTPUT);
+  digitalWrite(LCD_RST_PIN, LOW);
+  delay(20);
   digitalWrite(LCD_RST_PIN, HIGH);
+  delay(150);
   pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
   digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
 
@@ -194,6 +205,10 @@ void setup()
   {
     Serial.println("Starting LoRa failed!");
   }
+  else
+  {
+    Serial.println("LoRa init OK");
+  }
   // LoRa.begin() defaults to 17dBm via PA_BOOST, which draws a real current
   // spike (~100mA+) on transmit -- enough to visibly sag the shared 3.3V
   // rail and flicker the LCD without tripping a brownout reset. This link
@@ -201,7 +216,18 @@ void setup()
   // power is plenty; raise it if range testing shows it's needed.
   LoRa.setTxPower(2);
 
+  Serial.println("Calling ui.begin()...");
   ui.begin(LCD_CS_PIN, LCD_DC_PIN, TOUCH_CS_PIN, LCD_ORIENTATION_LANDSCAPE_4PIN_LEFT, UI_Font_13_Bold);
+  Serial.println("ui.begin() returned");
+
+  // TEMPORARY DIAGNOSTIC: simplest possible thing the LCD driver can do --
+  // fill the whole screen red. If this doesn't show up either, the problem
+  // is fundamental SPI/wiring/init, not anything specific to the menu/label
+  // drawing code. Remove once the blank-screen issue is resolved.
+  Serial.println("Diagnostic: filling screen red...");
+  ui.lcdClearScreen(LCD_RED);
+  delay(2000);
+  Serial.println("Diagnostic fill done");
 
   pitchOffset = ui.readConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, 0);
   rollOffset = ui.readConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, 0);
