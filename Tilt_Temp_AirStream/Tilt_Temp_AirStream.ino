@@ -1,582 +1,382 @@
+//      ******************************************************************
+//      *                                                                *
+//      *      Airstream v2.1 board -- tilt, temps, LoRa, touch UI       *
+//      *                                                                *
+//      ******************************************************************
+
 //
-// --------------  "01234567890123456789"
-char this_file[] = "Tilt_Temp_Tx" ;
-char descp[] =     "ESP32 TTGO LoRa" ;
-char ver[] =       "ver 1.1  12/31/22 " ;
-char ver2[] =      "Tilt + 2 Temps" ;
-char ver3[] =      "8 samples/50 ms loop" ;
+// Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 NTC-thermistor temps,
+// shows them on the ILI9341 touchscreen, and transmits them to the
+// TowVehicle board over LoRa. See ../hardware for schematics and
+// C:\Users\Harlow\.claude\plans\cozy-sauteeing-whale.md for the full plan
+// this was built from.
+//
+// IMPORTANT: the tilt axis mapping below is an UNVERIFIED PLACEHOLDER.
+// Run AxisOrientationTest.ino on the physically (vertically) mounted board
+// first and correct PITCH_FROM_AXES / ROLL_FROM_AXES / PITCH_SIGN /
+// ROLL_SIGN to match what you observe. See the comment block below.
+//
 
-#include <Adafruit_MPU6050.h> // use "" to specify that it should look for and be found in this sketch folder - not the libraries folder
-
-//Libraries for LoRa
+#include <Arduino.h>
+#include <Wire.h>
 #include <SPI.h>
+#include <EEPROM.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <LoRa.h>
+#include <TouchUserInterfaceForArduino.h>
+#include <UI_Fonts.h>
+#include "LoRaPacket.h"
 
-//Libraries for DS18B20 sensor
-#include <OneWire.h>
-byte temp1 = 13 ;
-byte temp2 = 25 ;
+char this_file[] = "Tilt_Temp_AirStream";
+char ver[] = "ver 2.1  " __DATE__;
 
-byte button = 17 ; // pushbutton I/O pin
+// ---------------------------------------------------------------------------------
+//                                    Pin definitions
+// ---------------------------------------------------------------------------------
+// See the Confirmed Hardware section of the plan for how these were derived
+// (schematic + the user's own Heltec pinout spreadsheet).
 
-//Libraries for OLED Display
-#include <Wire.h> // uncomment if not included elsewhere
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
- 
-//define the pins used by the LoRa transceiver module
-#define SCK 5
-#define MISO 19
-#define MOSI 27
-#define SS 18
-#define RST 14
-#define DIO0 26  
+// I2C -- MPU6050 (RTC deferred, not wired up in this version)
+const int SDA_PIN = 4;
+const int SCL_PIN = 15;
+const int MPU6050_ADDRESS = 0x69;  // ADO jumpered to 3.3V; keeps clear of PCF8523 RTC's fixed 0x68
 
-#define BAND 915E6 //915E6 for North America
+// SPI -- shared with the onboard LoRa radio; each device has its own CS
+const int SPI_SCK_PIN = 5;
+const int SPI_MISO_PIN = 19;
+const int SPI_MOSI_PIN = 27;
 
-//OLED pins
-#define OLED_SDA 4
-#define OLED_SCL 15 
-#define OLED_RST 16
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+// LoRa radio (standard Heltec WiFi LoRa 32 V2 pins)
+const int LORA_CS_PIN = 18;
+const int LORA_RST_PIN = 14;
+const int LORA_DIO0_PIN = 26;
+const long LORA_BAND = 915E6;
+
+// Touchscreen / LCD (ILI9341 + XPT2046)
+const int LCD_CS_PIN = 2;
+const int LCD_DC_PIN = 17;
+const int LCD_RST_PIN = 33;
+const int LCD_BACKLIGHT_PIN = 12;
+const int TOUCH_CS_PIN = 21;
+// TOUCH_IRQ_PIN (GPIO38) is on the schematic but not currently used by the library
+
+// Sensors. TEMP1/TEMP2 are on ESP32's ADC2, which the WiFi radio also uses --
+// reads can be unreliable while WiFi is active (LoRa/SPI/I2C are unaffected).
+// Not a concern today since this sketch doesn't use WiFi, but worth knowing
+// if that ever changes (e.g. adding OTA updates).
+const int TEMP1_PIN = 13;  // Fridge (ADC2)
+const int TEMP2_PIN = 25;  // Freezer (ADC2)
+const int TEMP3_PIN = 36;  // Inside Airstream (ADC1)
+const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter (ADC1)
+const int AMBLIGHTSENSE_PIN = 37;
+
+// Relay -- originally for a fridge cooling fan, no longer needed (fridge is
+// now self-cooling 12VDC). Held off; reserved for a future over-temp alarm.
+const int OUT2_RELAY_PIN = 32;
+
+// I/O-1 (GPIO23) is a spare pin on the connector, unused for now
+
+// ---------------------------------------------------------------------------------
+//                          Tilt axis mapping -- UNVERIFIED, see header comment
+// ---------------------------------------------------------------------------------
+// Run AxisOrientationTest.ino on the physically-mounted board, tilt the nose
+// up/down and watch which of angleFromXZ/YZ/XY moves (and which direction),
+// then do the same for left up/down. Update the two macros and two signs
+// below to match. As shipped these are just a starting guess (XZ->pitch,
+// YZ->roll) and are very likely wrong for a vertically-mounted board.
+#define PITCH_FROM_AXES(ax, ay, az) (atan2((ax), (az)) * 180.0 / PI)  // nose up(+)/down(-)
+#define ROLL_FROM_AXES(ax, ay, az) (atan2((ay), (az)) * 180.0 / PI)   // left up(+)/down(-)
+const float PITCH_SIGN = 1.0;
+const float ROLL_SIGN = 1.0;
+
+// Distance (inches) between the trailer's leveling/jack points. Left at 0
+// (disabled -- falls back to showing degrees) until measured for real.
+const float LEVEL_POINT_DISTANCE_INCHES = 0;
+
+// EEPROM addresses for the persisted zero-calibration offsets (see
+// TouchUserInterfaceForArduino's writeConfigurationFloat/readConfigurationFloat --
+// each float uses 5 bytes, so keep these at least 5 apart)
+const int EEPROM_ADDR_PITCH_OFFSET = 0;
+const int EEPROM_ADDR_ROLL_OFFSET = 10;
+
+// NTC thermistor conversion (3.3k series resistor, NTC to ground -- see
+// schematic). NOMINAL_RESISTANCE/B_COEFFICIENT are common 10k-NTC defaults
+// and are UNVERIFIED against the actual probe part; raw ADC counts are
+// printed to Serial to make calibrating these easier.
+const float SERIES_RESISTOR = 3300.0;
+const float NOMINAL_RESISTANCE = 10000.0;
+const float NOMINAL_TEMPERATURE_C = 25.0;
+const float B_COEFFICIENT = 3950.0;
+
+// ---------------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
+TouchUserInterfaceForArduino ui;
 
-Adafruit_SSD1306 display(128, 64, &Wire, OLED_RST);
-// Adafruit_SSD1306 display = Adafruit_SSD1306(128, 64, &Wire);
+LoRaPacket txPacket;
+float pitchOffset = 0;
+float rollOffset = 0;
 
-// const int MPU_addr=0x68; // Typical Address
-const int MPU_addr=0x69; // Moved to allow other device at 0x68
-int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZ;
- 
-int minVal=265;
-int maxVal=402;
- 
-// float x;
-// float y;
-float z;
+const int TILT_SAMPLE_COUNT = 8;
+float pitchSamples[TILT_SAMPLE_COUNT];
+float rollSamples[TILT_SAMPLE_COUNT];
+int tiltSampleIndex = 0;
 
-int xsamp[26] ;
-int ysamp[26] ;
-int xavI ;      // integer angle in hundredths
-int yavI ;      // integer angle in hundredths
-float xav ;
-float yav ;
-int xsum ;
-int ysum ;
-int xmax ;
-int xmin ;
-int ymax ;
-int ymin ;
+unsigned long lastTransmitTime = 0;
+const unsigned long TRANSMIT_INTERVAL_MS = 2000;
 
-int Temp_1 ;
-int Temp_2 ;
-int Temp_3 ;
+BUTTON zeroLevelButton = {"Zero Level", 260, 210, 100, 40};
 
-byte sync_byte ;
-byte cmd_byte ;
-byte counter ; // loop counter
+// ---------------------------------------------------------------------------------
+//                                     Setup
+// ---------------------------------------------------------------------------------
 
-byte i ;
-String LoRaData ;
-double LoRa_Tx_time ;
-double Tilt_clk ; // max 10 minutes
-bool Tilt_flag ;  // true=tilt mode, false=temps mode
-double temp_clk ; // sets the trigger for sending temps
-double ds_clk ; // allow 1 sec conversion time between starts
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println(this_file);
+  Serial.println(ver);
 
- 
- /* &&&&&&&&&&&&&&&&& LoRa receive and transmit functions &&&&&&&&&&&&&&&&&
-  // go to https://github.com/sandeepmistry/arduino-LoRa/blob/master/API.md
-  // for the full API commands list
-  
-  LoRa.setPins(ss, reset, dio0);
-  // Must be called before LoRa.begin().
-  // ss - new slave select pin to use, defaults to 10
-  // reset - new reset pin to use, defaults to 9
-  // dio0 - new DIO0 pin to use, defaults to 2. Must be interrupt capable via 
-  // attachInterrupt(...).
+  // ESP32's EEPROM library is flash-backed and requires begin() before use --
+  // the UI library's writeConfigurationFloat/readConfigurationFloat assume
+  // this has already been called (see TouchUserInterfaceForArduino.cpp).
+  EEPROM.begin(64);
 
+  pinMode(OUT2_RELAY_PIN, OUTPUT);
+  digitalWrite(OUT2_RELAY_PIN, LOW);
+
+  setupTiltSensor();
+
+  pinMode(LCD_RST_PIN, OUTPUT);
+  digitalWrite(LCD_RST_PIN, HIGH);
+  pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
+
+  // Shared SPI bus (LoRa radio + LCD + touch controller), custom pins --
+  // must be configured before LoRa.begin() and ui.begin(), both of which
+  // use the default SPI object internally.
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+
+  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  if (!LoRa.begin(LORA_BAND))
+  {
+    Serial.println("Starting LoRa failed!");
+  }
+
+  ui.begin(LCD_CS_PIN, LCD_DC_PIN, TOUCH_CS_PIN, LCD_ORIENTATION_LANDSCAPE_4PIN_LEFT, UI_Font_13_Bold);
+
+  pitchOffset = ui.readConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, 0);
+  rollOffset = ui.readConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, 0);
+
+  for (int i = 0; i < TILT_SAMPLE_COUNT; i++)
+  {
+    pitchSamples[i] = 0;
+    rollSamples[i] = 0;
+  }
+
+  drawInfoScreenLayout();
+}
+
+void setupTiltSensor()
+{
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  if (!mpu.begin(MPU6050_ADDRESS, &Wire))
+  {
+    Serial.println("MPU6050 not found at 0x69 -- check the ADO jumper and wiring");
+  }
+
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+}
+
+// ---------------------------------------------------------------------------------
+//                                      Loop
+// ---------------------------------------------------------------------------------
+
+void loop()
+{
+  updateTilt();
+  updateTemperatures();
+
+  ui.getTouchEvents();
+  if (ui.checkForButtonClicked(zeroLevelButton))
+  {
+    pitchOffset += txPacket.pitch;
+    rollOffset += txPacket.roll;
+    ui.writeConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, pitchOffset);
+    ui.writeConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, rollOffset);
+  }
+
+  drawInfoScreenValues();
+
+  if (millis() - lastTransmitTime >= TRANSMIT_INTERVAL_MS)
+  {
+    lastTransmitTime = millis();
+    transmitPacket();
+  }
+
+  delay(50);
+}
+
+// ---------------------------------------------------------------------------------
+//                                  Tilt sensing
+// ---------------------------------------------------------------------------------
+
+void updateTilt()
+{
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+
+  float ax = accel.acceleration.x;
+  float ay = accel.acceleration.y;
+  float az = accel.acceleration.z;
+
+  pitchSamples[tiltSampleIndex] = PITCH_SIGN * PITCH_FROM_AXES(ax, ay, az);
+  rollSamples[tiltSampleIndex] = ROLL_SIGN * ROLL_FROM_AXES(ax, ay, az);
+  tiltSampleIndex = (tiltSampleIndex + 1) % TILT_SAMPLE_COUNT;
+
+  float pitchSum = 0;
+  float rollSum = 0;
+  for (int i = 0; i < TILT_SAMPLE_COUNT; i++)
+  {
+    pitchSum += pitchSamples[i];
+    rollSum += rollSamples[i];
+  }
+
+  float pitchDegrees = (pitchSum / TILT_SAMPLE_COUNT) - pitchOffset;
+  float rollDegrees = (rollSum / TILT_SAMPLE_COUNT) - rollOffset;
+
+  if (LEVEL_POINT_DISTANCE_INCHES > 0)
+  {
+    txPacket.pitch = tan(pitchDegrees * PI / 180.0) * LEVEL_POINT_DISTANCE_INCHES;
+    txPacket.roll = tan(rollDegrees * PI / 180.0) * LEVEL_POINT_DISTANCE_INCHES;
+  }
+  else
+  {
+    txPacket.pitch = pitchDegrees;
+    txPacket.roll = rollDegrees;
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                                 Temperature sensing
+// ---------------------------------------------------------------------------------
+
+float readThermistorTempF(int pin)
+{
+  int adc = analogRead(pin);
+  float voltageRatio = (float)adc / 4095.0;
+
+  if (voltageRatio <= 0.001 || voltageRatio >= 0.999)
+  {
+    return NAN;  // probe likely open or shorted
+  }
+
+  float resistance = SERIES_RESISTOR * voltageRatio / (1.0 - voltageRatio);
+
+  float steinhart = resistance / NOMINAL_RESISTANCE;
+  steinhart = log(steinhart);
+  steinhart /= B_COEFFICIENT;
+  steinhart += 1.0 / (NOMINAL_TEMPERATURE_C + 273.15);
+  steinhart = 1.0 / steinhart;
+  steinhart -= 273.15;  // deg C
+
+  return steinhart * 9.0 / 5.0 + 32.0;
+}
+
+void updateTemperatures()
+{
+  txPacket.temp1 = readThermistorTempF(TEMP1_PIN);
+  txPacket.temp2 = readThermistorTempF(TEMP2_PIN);
+  txPacket.temp3 = readThermistorTempF(TEMP3_PIN);
+  txPacket.temp4 = readThermistorTempF(TEMP4_PIN);
+}
+
+// ---------------------------------------------------------------------------------
+//                                 LoRa transmit
+// ---------------------------------------------------------------------------------
+
+void transmitPacket()
+{
   LoRa.beginPacket();
-  LoRa.beginPacket(implicitHeader);
-  // implicitHeader - (optional) true enables implicit header mode, false 
-  // enables explicit header mode (default)
-  // Returns 1 if radio is ready to transmit, 0 if busy or on failure.
-  
-  LoRa.write(byte);
-  LoRa.write(buffer, length);
-  // byte - single byte to write to packet
-  // or
-  // buffer - data to write to packet
-  // length - size of data to write
-  // can contain up to 255 bytes.
-  // Returns the number of bytes written.
-  // Note: Other Arduino Print API's can also be used to write data into the packet
-
+  LoRa.write((uint8_t *)&txPacket, sizeof(txPacket));
   LoRa.endPacket();
-  LoRa.endPacket(async);
-  // async - (optional) true enables non-blocking mode, false waits for transmission
-  // to be completed (default)
-  // Returns 1 on success, 0 on failure.
-  
-  LoRa.setSpreadingFactor(spreadingFactor);
-  // defaults to 7. Supported values are between 6 and 12. If a spreading 
-  // factor of 6 is set, implicit header mode must be used to transmit 
-  // and receive packets.
-  
-  // the TOA below is highly dependent on message length, as wel as SF
-  // do a loop timer test to determine your specific TOA
-  // these times are approximate upper limits for 50-byte messages
-  //		Data Rate	Range	Time on Air
-  // SF7	5470 bps	2 km	 113 ms
-  // SF8	3125 bps	4 km	 205 ms
-  // SF9	1760 bps	6 km	 369 ms
-  // SF10	980 bps		8 km	 698 ms
-  // SF11	440 bps		11 km	1478 ms
-  // SF12	290 bps		14 km	2629 ms
-  
-  LoRa.setCodingRate4(codingRateDenominator);
-  // denominator of the coding rate, defaults to 5. Supported values are 
-  // between 5 and 8, these correspond to coding rates 
-  // of 4/5 and 4/8. The coding rate numerator is fixed at 4.
-  
-  LoRa.setSignalBandwidth(signalBandwidth);
-  // Supported values are 7.8E3, 10.4E3, 15.6E3, 20.8E3, 31.25E3, 
-  // 41.7E3, 62.5E3, 125E3, 250E3, and 500E3.
-  
-  LoRa.setSyncWord(syncWord);
-  // byte value to use as the sync word, defaults to 0x12
-  
-// Pick one ******************************
-  // LoRa.enableCrc();
-  // LoRa.disableCrc();
-  //   Enable or disable CRC usage, by default a CRC is not used.
 
-  int packetSize = LoRa.parsePacket();
-  int packetSize = LoRa.parsePacket(size);
-  // Check if a packet has been received.
-  // size - (optional) if > 0 implicit header mode is enabled with 
-  // the expected packet of size bytes, default mode is explicit header mode
-  // Returns the packet size in bytes or 0 if no packet was received. 
-  
-  int rssi = LoRa.packetRssi();
-  // Returns the averaged RSSI of the last received packet (dBm).
-
-  float snr = LoRa.packetSnr();
-  // Returns the estimated SNR of the received packet in dB.
-
-  int rssi = LoRa.rssi();
-  // Returns the current RSSI of the radio (dBm). RSSI can be read 
-  // at any time (during packet reception or not)
-
-  int availableBytes = LoRa.available()
-  // Returns number of bytes available for reading.
-
-  byte b = LoRa.peek();
-  // Returns the next byte in the packet or -1 if no bytes are available.
-
-  byte b = LoRa.read();
-  // Returns the next byte in the packet or -1 if no bytes are available.
-  // Note: Other Arduino Stream API's can also be used to read data from 
-  // the packet
-
-*/ // &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
-
-/* ########################## OLED Commands ##################################
-
-  display.setRotation(x)
-  // x = 0,1,2,3 for 0, 90, 180, 270 degrees of rotation
-  
-*/ // ########################################################################
-
-//
-// =======================================================================
-void setup() {
-	
-	pinMode(button, INPUT_PULLUP);
-	
-	Serial.begin(9600);
-	// while (!Serial);
-	delay(100) ;
-
-	Serial.println() ;
-	Serial.println(this_file) ; //file name
-	Serial.println(descp) ;     //description
-	Serial.println(ver) ;       //version and date
-	Serial.println(ver2) ;      //version and date
-	Serial.println(ver3) ;      //version and date
-	Serial.println() ;
- 
-	Wire.begin(OLED_SDA, OLED_SCL);
-
-  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;) ; // Don't proceed, loop forever
-  }
-  
-	display.display();
-	display.setTextSize(1);
-	display.setTextColor(WHITE);
-	display.setRotation(0);
-
-	display.clearDisplay();
-	display.setCursor(0,0);
-	display.print(this_file);
-	display.setCursor(0,15);
-	display.print(descp);
-	display.setCursor(0,30);
-	display.print(ver);
-	display.setCursor(0,40); 
-	display.print(ver2);  
-	display.display();
-
-	delay(3000) ; // reading time  
-
-	Serial.println("MPU6050 OLED demo");
-
-	if (!mpu.begin()) {
-		Serial.println("Sensor init failed");
-		while (1)yield() ; // halt here
-	}
-	Serial.println("Found a MPU-6050 sensor");
-
-	//SPI LoRa pins
-	SPI.begin(SCK, MISO, MOSI, SS);
-	//setup LoRa transceiver module
-	LoRa.setPins(SS, RST, DIO0);
-
-	if (!LoRa.begin(BAND)) {
-		Serial.println("Starting LoRa failed!");
-		while (1);
-	}
-
-	display.clearDisplay();
-	Serial.println("LoRa Initializing OK!");
-	display.setCursor(0,10);
-	display.print("LoRa Initializing OK!");
-	display.display();
-	delay(2000);
-  
-	Tilt_flag = false ;
-	LoRa.setSpreadingFactor(12); // temp mode
-
-	display.setTextSize(3);
-	LoRa_Tx_time = millis() ; // start the clock
-	temp_clk = millis() ; // start the clock (~5 sec)
-	
-	readtemps() ; // start the first conversion
-	ds_clk = millis() ; // start the 1 sec conversion time
-  
+  Serial.print("TX  pitch=");
+  Serial.print(txPacket.pitch, 1);
+  Serial.print("  roll=");
+  Serial.print(txPacket.roll, 1);
+  Serial.print("  t1=");
+  Serial.print(txPacket.temp1, 1);
+  Serial.print("  t2=");
+  Serial.print(txPacket.temp2, 1);
+  Serial.print("  t3=");
+  Serial.print(txPacket.temp3, 1);
+  Serial.print("  t4=");
+  Serial.print(txPacket.temp4, 1);
+  Serial.print("  light=");
+  Serial.println(analogRead(AMBLIGHTSENSE_PIN));
 }
 
-// ============================ LOOP() ====================================
-void loop() {
-int packetSize ;
+// ---------------------------------------------------------------------------------
+//                                    Display
+// ---------------------------------------------------------------------------------
 
-	sync_byte = 0 ;
-	cmd_byte = 0 ;
-	if(get_key()) change_mode() ; // change mode?
-	if(Tilt_flag == false) {      // temp mode
-		Temp() ; // read and send temperatures/door status
-		//try to parse packet, look for mode switch command
-		packetSize = LoRa.parsePacket();
-		if (packetSize) { // packet received
-		Serial.print("Command packetSize = ") ;
-		Serial.println(packetSize) ;
-			if (packetSize == 2) { //
-				//read packet
-				sync_byte = LoRa.read();  // sync byte
-				cmd_byte = LoRa.read() ;  // command byte
-				Serial.print("Sync byte = ") ;
-				Serial.println(sync_byte, HEX) ;
-				Serial.print("Cmd byte = ") ;
-				Serial.println(cmd_byte, HEX) ;
-				if((sync_byte == 0xAB) && (cmd_byte == 0x05)) {
-					change_mode() ; // go to tilt mode
-				}		
-			} 
-		}
-	} else { // tilt mode
-	// you can only leave the tilt mode via pushbutton or
-	// when the clock runs out.
-		// auto revert to temp mode, 10 minutes
-		if(((millis() - Tilt_clk) < 600000)) { 
-			Tilt() ;
-		} else {
-			LoRa.parsePacket(); // dump leftover packets
-			change_mode() ; // go to temp mode
-		}
-	}
-	
-} // ========================= end of loop =================================
+const int VALUE_COLUMN_X = 170;
+const int LINE_HEIGHT = 26;
+const int FIRST_LINE_Y = 40;
 
-// --------------------------------------------------------------------------
+void drawInfoScreenLayout()
+{
+  ui.drawTitleBar("Airstream Monitor");
+  ui.clearDisplaySpace();
 
-bool get_key() { // button = I/O pin 17
-
-bool key_flag = false ;
-// most keypad functions only activate when the key is released.
-// this routine activates once the debounce time has been met.
-// the reason is that there are LoRa transmit times that can
-// be longer than 1 second, so the pushbutton needs to be held
-// down until the activation is apparent. The debounce hopefully
-// will prevent a re-dection upon release of the button.
-	// debounce 40 ms
-	if(!digitalRead(button)) { // button down?
-		delay(20) ;  // start a clock
-		if(!digitalRead(button)) {
-			delay(20) ;  // start another clock
-			if(!digitalRead(button)) {
-				key_flag = true ;
-				Serial.println("Button push");
-			}
-		}
-	}
-	return key_flag ;
-	
-} // ---------------- end of get_key() ----------------------------
-
-void change_mode() {
-	
-	Serial.println("Change Mode");
-	
-//setup LoRa transceiver module
-	LoRa.setPins(SS, RST, DIO0);
-	if(!LoRa.begin(BAND)) {
-		Serial.println("Starting LoRa failed!");
-		while (1); // halt here
-	}
-	if(Tilt_flag) { // tilt mode
-	  LoRa.setSpreadingFactor(12); // temp mode	
-	  Tilt_flag = false ;
-	  Serial.println("Starting LoRa SF12 OK");
-	} else {
-	  LoRa.setSpreadingFactor(9); // tilt mode
-	  Tilt_flag = true ;
-	  Tilt_clk = millis() ; // auto revert to temp mode
-	  Serial.println("Starting LoRa SF-9 OK");
-	}
-	
-// display the mode
-	display.clearDisplay();
-	display.setTextSize(3);
-	display.setCursor(0,15);
-	if(Tilt_flag) {
-		display.print("TILT") ;
-	} else {
-		display.print("Temp") ;
-	}
-	display.display(); 
-	delay(5000) ; // reading time
-	
-} // ---------------- end of change_mode() -------------------
-
-// --------------------------- Tilt() ---------------------------
-void Tilt() { // get the tilt x,y (left/right, up/down) angle data 
-  
-  Wire.beginTransmission(MPU_addr);
-	Wire.write(0x3B);
-	Wire.endTransmission(false);
-	Wire.requestFrom(MPU_addr,14,true);
-	AcX=Wire.read()<<8|Wire.read();
-	AcY=Wire.read()<<8|Wire.read();
-	AcZ=Wire.read()<<8|Wire.read();
-	int xAng = map(AcX,minVal,maxVal,-90,90);
-	int yAng = map(AcY,minVal,maxVal,-90,90);
-	int zAng = map(AcZ,minVal,maxVal,-90,90);
-
-  int	x = 5729.6 * (atan2(-yAng, -zAng)+PI);
-  int	y = 5730 * (atan2(-xAng, -zAng)+PI);	 
-//	x = RAD_TO_DEG * (atan2(-yAng, -zAng)+PI);
-//	y = RAD_TO_DEG * (atan2(-xAng, -zAng)+PI);
-	// z= RAD_TO_DEG * (atan2(-yAng, -xAng)+PI);
-	 
-//	Serial.print("X= ");
-	if(x > 27000) x = x - 36000 ; // hundredths
-	rollx(x) ;
-		
-//	Serial.print("Y= ");
-	if(y > 27000) y = y - 36000 ; // hundredths
-	rolly(y) ;
-	
-// Display packet information
-  display.clearDisplay();
-  display.setCursor(0,4);
-  if(!(yav < 0)) {
-		display.print("Up ");
-  } else {
-		display.print("Dn ") ;
-		yav = -yav ;
-  } 
-  if((abs(yav)<10)) display.print(" ");
-  display.print(yav, 1);
-  display.setCursor(0,40);
-  if(!(xav < 0)) {
-		display.print("R  ");
-  } else {
-		display.print("L  ") ;
-		xav = -xav ;
+  const char *labels[] = {"Nose Up/Down", "Left Up/Down", "Fridge", "Freezer", "Inside AS", "DC Cabinet", "Light"};
+  for (int i = 0; i < 7; i++)
+  {
+    ui.lcdSetCursorXY(10, FIRST_LINE_Y + i * LINE_HEIGHT);
+    ui.lcdPrint(labels[i]);
   }
-  if((abs(xav)<10)) display.print(" ");
-  display.print(xav, 1);
-  display.display();
 
-  if(LoRa.beginPacket() == 1) {
-//  Loop time w/o Tx is 27 ms
-//	Serial.print("MS Margin = ") ;
-//	Serial.println(200-(millis()-LoRa_Tx_time)) ;
-	  if(((millis() - LoRa_Tx_time) > 200)) {
-		// Tx ~5 per sec, ~85 ms quiet time
-		// Tx time is 31 ms at SF7 (default)
-	    // Tx time is 104 ms at SF9
-		LoRa_Tx_time = millis() ;   // restart Tx clock
-		LoRa.write(lowByte(xavI)) ; // byte
-		LoRa.write(highByte(xavI)); // byte
-		LoRa.write(lowByte(yavI)) ; // byte
-		LoRa.write(highByte(yavI)); // byte
-		LoRa.endPacket() ; // /Tx the data
-//		Serial.print("On air time = ") ;
-//		Serial.println(millis()-LoRa_Tx_time) ;
-//		Serial.println(" ----------------------- ") ;
-	  }
-  }
-} // --------------------------- end of Tilt() ---------------------------
-
-void rollx(int a) {
-	for(i=16;i>0; i --) { // i max is 26
-		xsamp[i] = xsamp[i - 1] ;
-	}
-	xsamp[0] = a ;
-	xsum = 0 ;
-//	xmax = 0 ;
-//	xmin = 45 ;
-	for(i=0;i<8; i ++) {
-//		if(abs(xsamp[i]) > xmax) xmax = abs(xsamp[i]) ;
-//		if(abs(xsamp[i]) < xmin) xmin = abs(xsamp[i]) ;
-		xsum = xsum + xsamp[i] ;
-	}
-	xavI = xsum / 8 ; // divide by 8
-	xav = xavI / 100.0 ;
+  ui.drawButton(zeroLevelButton);
 }
 
-void rolly(int a) {
-	for(i=16;i>0; i --) {  // i max is 26
-		ysamp[i] = ysamp[i - 1] ;
-	}
-	ysamp[0] = a ;
-	ysum = 0 ;
-//	ymax = 0 ;
-//	ymin = 45 ;
-	for(i=0;i<8;i ++) {
-//		if(abs(ysamp[i]) > ymax) ymax = abs(ysamp[i]) ;
-//		if(abs(ysamp[i]) < ymin) ymin = abs(ysamp[i]) ;
-		ysum = ysum + ysamp[i] ;
-	}
-	yavI = ysum / 8 ; // divide by 8
-	yav = yavI / 100.0 ;
+void drawValueField(int lineIndex, const char *text)
+{
+  int y = FIRST_LINE_Y + lineIndex * LINE_HEIGHT;
+  ui.lcdDrawFilledRectangle(VALUE_COLUMN_X, y, 120, ui.lcdGetFontHeightWithDecenders(), LCD_BLACK);
+  ui.lcdSetCursorXY(VALUE_COLUMN_X, y);
+  ui.lcdPrint(text);
 }
 
-// -------------------------- Temp() -------------------------------
-void Temp() { // read and send two temperatures
-	
-	// time for DS18B20 conversion
-	if((millis() - ds_clk) > 1000) { // allow 1 second
-		readtemps() ;
-		ds_clk = millis() ;
-	}
-	if((millis() - temp_clk) > 10000) { // send temps ~10 secs
-		temp_clk = millis() ; // reset the clock
-		Serial.print("Sending packet: ");
-		Serial.print(counter);
-		Serial.print(":  ");
-		Serial.print(Temp_1 / 100.0) ;
-		Serial.print("  ");
-		Serial.println(Temp_2 / 100.0) ;
-	//	Serial.println(Temp_3 / 100.0) ;
-		
-	//Send LoRa packet to receiver
-		LoRa.beginPacket();
-		LoRa.write(0x69) ; // user sync byte
-		LoRa.write(lowByte(counter)) ;
-		LoRa.write(lowByte(Temp_1));
-		LoRa.write(highByte(Temp_1));
-		LoRa.write(lowByte(Temp_2));
-		LoRa.write(highByte(Temp_2));
-		LoRa.endPacket();
+void drawInfoScreenValues()
+{
+  char buf[24];
+  const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
 
-		display.clearDisplay();
-		display.setTextSize(1);
-		display.setCursor(0,0);
-		display.print("LORA SENDER: ");
-		display.println(counter) ;
-		display.setTextSize(3);
-		display.setCursor(0,15);
-		display.print(" ") ;
-		if(!(Temp_1<0)) {
-			if(Temp_1<10000) display.print(" ") ;
-			if(Temp_1<1000) display.print(" ") ;
-		} else {
-			if(abs(Temp_1)<1000) display.print(" ") ;
-		}
-		display.print(Temp_1/100.0, 1);   
-		display.setCursor(0,40);
-		display.print(" ") ;
-		if(!(Temp_2<0)) {
-			if(Temp_2<10000) display.print(" ") ;
-			if(Temp_2<1000) display.print(" ") ;
-		} else {
-			if(abs(Temp_2)<1000) display.print(" ") ;
-		}
-		display.print(Temp_2/100.0, 1); 
-		display.display();
+  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.pitch, unit);
+  drawValueField(0, buf);
 
-		counter++;
-		if(counter > 99) counter = 0 ;
-	}
-	
-} // -------------------- end of temp() ------------------------------
+  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.roll, unit);
+  drawValueField(1, buf);
 
-// ------------------ readtemps() -------------------------------------
-void readtemps() {
-	
-// one sensor per I/O line, simple OneWire call
-	Temp_1 = dallas(temp1) ; 
-	Temp_2 = dallas(temp2) ; 
-//	Temp_3 = dallas(21) ; 
+  snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp1);
+  drawValueField(2, buf);
 
-} // ----------------- end of readtemps() -------------------
+  snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp2);
+  drawValueField(3, buf);
 
-// --------------------- quick dallas() -------------------------------
-// DS18B20 sensor chip driver code
-// the standard library takes several seconds, this takes usecs.
-// the logic is (1) read the chip (2) start the conversion.
-// a one-second delay between calls is required to allow the
-// conversion process to complete so that the next read is good.
-// limited to only one chip per I/O pin
+  snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp3);
+  drawValueField(4, buf);
 
-int dallas(byte x) {
-	
-OneWire ds(x) ;
-int data0 ;
-int data1 ;
-int result ;
+  snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp4);
+  drawValueField(5, buf);
 
-	ds.reset() ;
-	ds.write(0xCC) ;  // skip command
-	ds.write(0xBE) ;  // Read 1st 2 bytes of Scratchpad
-	data0 = ds.read() ;
-	data1 = ds.read() ;
-	result = (data1 << 8) | data0 ;
-//	Serial.print("===== ") ;
-//	Serial.print(result, HEX) ;
-//	Serial.println(" ======") ;
-	if(result > 4095) result = (result - 0x0ffff) -1 ;
-	result = (((result * 90)+0x04) >> 3 ) + 3200 ;  // F x 100
-	ds.reset() ;
-	ds.write(0xCC) ;   // skip command
-	ds.write(0x44,1) ; // start conversion
-	return result ;
-	
-} // ----------------- end of dallas() -------------------
+  snprintf(buf, sizeof(buf), "%d", analogRead(AMBLIGHTSENSE_PIN));
+  drawValueField(6, buf);
+}

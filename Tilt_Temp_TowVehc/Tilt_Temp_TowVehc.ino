@@ -1,394 +1,268 @@
+//      ******************************************************************
+//      *                                                                *
+//      *   TowVehicle board -- buttons, LEDs, OLED, LoRa receive        *
+//      *                                                                *
+//      ******************************************************************
+
 //
-// --------------  "01234567890123456789"
-char this_file[] = "Tilt_Temp_TowVehc" ;
-char descp[] =     "ESP32 TTGO LoRa OLED" ;
-char ver[] =       "ver 1.1  12/31/22 " ;
-char ver2[] =      "LORA/angles/temps  " ;
-char ver3[] =      "discrete/door status" ;
+// Heltec WiFi LoRa 32 V2. Receives tilt/temp data from the Airstream board
+// over LoRa and shows it on the built-in OLED. Buttons cycle between
+// screens; see ../hardware for schematics and
+// C:\Users\Harlow\.claude\plans\cozy-sauteeing-whale.md for the full plan
+// this was built from.
+//
 
-//Libraries for LoRa
+#include <Arduino.h>
 #include <SPI.h>
-#include <LoRa.h>
-
-//Libraries for OLED Display
 #include <Wire.h>
+#include <string.h>
+#include <LoRa.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "LoRaPacket.h"
 
-byte button = 17 ; // pushbutton I/O pin
+char this_file[] = "Tilt_Temp_TowVehc";
+char ver[] = "ver 2.1  " __DATE__;
 
-//define the pins used by the LoRa transceiver module
-#define SCK 5
-#define MISO 19
-#define MOSI 27
-#define SS 18
-#define RST 14
-#define DIO0 26
+// ---------------------------------------------------------------------------------
+//                                    Pin definitions
+// ---------------------------------------------------------------------------------
+// See the Confirmed Hardware section of the plan for how these were derived
+// from the corrected schematic.
 
-#define BAND 915E6 //915E6 for North America
+const int BUTTON1_PIN = 17;  // previous screen
+const int BUTTON2_PIN = 39;  // next screen
+const int BUTTON3_PIN = 38;  // mute/acknowledge alert
+const int BUTTON4_PIN = 12;  // spare (logged to Serial only for now)
 
-//OLED pins
-#define OLED_SDA 4
-#define OLED_SCL 15 
-#define OLED_RST 16
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+const int LED1_PIN = 2;   // heartbeat: brief flash on each received packet
+const int LED2_PIN = 32;  // alert: solid on when the LoRa link is lost
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+// Built-in OLED (standard Heltec WiFi LoRa 32 V2 wiring)
+const int OLED_SDA_PIN = 4;
+const int OLED_SCL_PIN = 15;
+const int OLED_RST_PIN = 16;
+const int SCREEN_WIDTH = 128;
+const int SCREEN_HEIGHT = 64;
 
-bool Tilt_flag ;
-double Tilt_clk ;
-byte sync_byte ;
-byte counter ;
-int packetSize ;
-unsigned int loop_Time ;
+// LoRa radio (standard Heltec WiFi LoRa 32 V2 pins)
+const int SPI_SCK_PIN = 5;
+const int SPI_MISO_PIN = 19;
+const int SPI_MOSI_PIN = 27;
+const int LORA_CS_PIN = 18;
+const int LORA_RST_PIN = 14;
+const int LORA_DIO0_PIN = 26;
+const long LORA_BAND = 915E6;
 
- /* &&&&&&&&&&&&&&&&&&&&&&& LoRa receive functions &&&&&&&&&&&&&&&&&&&&&&&&
-  // go to https://github.com/sandeepmistry/arduino-LoRa/blob/master/API.md
-  // for the full API commands list
-  
-  int packetSize = LoRa.parsePacket();
-  int packetSize = LoRa.parsePacket(size);
-  //  Check if a packet has been received.
-  // size - (optional) if > 0 implicit header mode is enabled with 
-  // the expected packet of size bytes, default mode is explicit header mode
-  // Returns the packet size in bytes or 0 if no packet was received. 
-  
-  int rssi = LoRa.packetRssi();
-  // Returns the averaged RSSI of the last received packet (dBm).
+// ---------------------------------------------------------------------------------
 
-  float snr = LoRa.packetSnr();
-  // Returns the estimated SNR of the received packet in dB.
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST_PIN);
 
-  int rssi = LoRa.rssi();
-  // Returns the current RSSI of the radio (dBm). RSSI can be read 
-  // at any time (during packet reception or not)
+LoRaPacket rxPacket;
+unsigned long lastPacketTime = 0;
+const unsigned long LINK_LOST_TIMEOUT_MS = 30000;
+bool alertMuted = false;
 
-  int availableBytes = LoRa.available()
-  // Returns number of bytes available for reading.
+enum Screen
+{
+  SCREEN_LEVEL = 0,
+  SCREEN_TEMPS = 1,
+  SCREEN_LINK = 2,
+  SCREEN_COUNT = 3
+};
+int currentScreen = SCREEN_LEVEL;
 
-  byte b = LoRa.peek();
-  // Returns the next byte in the packet or -1 if no bytes are available.
+// simple debounce: pin, and whether it was down last time we checked
+struct DebouncedButton
+{
+  int pin;
+  bool wasDown;
+};
+DebouncedButton buttons[4] = {
+    {BUTTON1_PIN, false},
+    {BUTTON2_PIN, false},
+    {BUTTON3_PIN, false},
+    {BUTTON4_PIN, false},
+};
 
-  byte b = LoRa.read();
-  // Returns the next byte in the packet or -1 if no bytes are available.
-  // Note: Other Arduino Stream API's can also be used to read data from 
-  // the packet
+// ---------------------------------------------------------------------------------
+//                                     Setup
+// ---------------------------------------------------------------------------------
 
-*/ // &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&
-void setup() { 
+void setup()
+{
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println(this_file);
+  Serial.println(ver);
 
-  pinMode(button, INPUT_PULLUP) ;
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);  // GPIO17 supports an internal pull-up
+  pinMode(BUTTON2_PIN, INPUT);         // GPIO39 is input-only, no internal pull-up -- board has an external 10K pull-up (R3)
+  pinMode(BUTTON3_PIN, INPUT);         // GPIO38 is input-only, no internal pull-up -- board has an external 10K pull-up (R4)
+  pinMode(BUTTON4_PIN, INPUT_PULLUP);  // GPIO12 supports an internal pull-up
+  pinMode(LED1_PIN, OUTPUT);
+  pinMode(LED2_PIN, OUTPUT);
+  digitalWrite(LED1_PIN, LOW);
+  digitalWrite(LED2_PIN, LOW);
 
-  Serial.begin(9600);
-  // while (!Serial);
-  delay(100) ;
-  
-  // show the file name and version
-  Serial.println() ;
-  Serial.println(this_file) ; //file name
-  Serial.println(descp) ;     //description
-  Serial.println(ver) ;       //version and date
-  Serial.println(ver2) ;      //version and date
-  Serial.println(ver3) ;      //version and date
-  Serial.println() ;
-  delay(3000) ;
-  
-  //reset OLED display via software
-  pinMode(OLED_RST, OUTPUT);
-  digitalWrite(OLED_RST, LOW);
-  delay(20);
-  digitalWrite(OLED_RST, HIGH);
-  
-  //initialize OLED
-  Wire.begin(OLED_SDA, OLED_SCL);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C, false, false)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;); // Don't proceed, loop forever
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    Serial.println("SSD1306 allocation failed");
+    while (1)
+      delay(1000);
   }
-
+  display.setTextColor(SSD1306_WHITE);
   display.clearDisplay();
-  display.setTextColor(WHITE);
   display.setTextSize(1);
-  display.setCursor(0,0);
-  display.print("LORA RECEIVER ");
+  display.setCursor(0, 0);
+  display.println(this_file);
+  display.println(ver);
   display.display();
-  
-  //SPI LoRa pins
-  SPI.begin(SCK, MISO, MOSI, SS);
-  //setup LoRa transceiver module
-  LoRa.setPins(SS, RST, DIO0);
 
-  if (!LoRa.begin(BAND)) {
+  SPI.begin(SPI_SCK_PIN, SPI_MISO_PIN, SPI_MOSI_PIN);
+  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  if (!LoRa.begin(LORA_BAND))
+  {
     Serial.println("Starting LoRa failed!");
-    while (1);
+    display.println("LoRa init failed!");
+    display.display();
   }
 
-  display.setCursor(0,15);
-  display.println("LoRa Initializing OK!");
-  display.setCursor(0,30);
-  display.println("Ready for temps");
-  display.display(); 
+  memset(&rxPacket, 0, sizeof(rxPacket));
 
-  LoRa.setSpreadingFactor(12);  // long range, 10 sec loop
-  
-  display.setTextSize(3);
+  delay(1500);
+  drawScreen();
 }
-// ========================== loop() ==========================
-void loop() {
 
-	if(get_key()) change_mode() ; // change mode?
-	if(Tilt_flag == false) {      // temp mode
-		Temps() ; // read and display temperatures/door status
-	} else { // tilt mode, display the angles
-	// you can only leave the tilt mode via pushbutton or
-	// when the clock runs out.
-		// auto revert to temp mode, 10 minutes
-		if(((millis() - Tilt_clk) < 600000)) { 
-			Angles() ;
-		} else {
-			change_mode() ; // go to temp mode
-		}
-	}
-	
-} // ========================= end of loop() ======================
+// ---------------------------------------------------------------------------------
+//                                      Loop
+// ---------------------------------------------------------------------------------
 
-// -------------------------- get_key() -------------------------------
-// most keypad functions only activate when the key is released.
-// this routine activates once the debounce time has been met.
-// the reason is that there are LoRa transmit times that can
-// be longer than 1 second, so the pushbutton needs to be held
-// down until the activation is apparent. The debounce hopefully
-// will prevent a re-dection upon release of the button.
+void loop()
+{
+  receiveLoRaPacket();
+  handleButtons();
+  updateAlertLED();
+  drawScreen();
+  delay(50);
+}
 
-bool get_key() { // button = I/O pin 17
+// ---------------------------------------------------------------------------------
+//                                 LoRa receive
+// ---------------------------------------------------------------------------------
 
-bool key_flag = false ;
+void receiveLoRaPacket()
+{
+  int packetSize = LoRa.parsePacket();
+  if (packetSize != sizeof(rxPacket))
+  {
+    return;
+  }
 
-	// debounce 40 ms
-	if(!digitalRead(button)) { // button down?
-		delay(20) ;  // start a clock
-		if(!digitalRead(button)) {
-			delay(20) ;  // start another clock
-			if(!digitalRead(button)) {
-				key_flag = true ;
-				Serial.println("Button push");
-			}
-		}
-	}
-	return key_flag ;
-	
-} // ---------------- end of get_key() ----------------------------
+  LoRa.readBytes((uint8_t *)&rxPacket, sizeof(rxPacket));
+  lastPacketTime = millis();
+  alertMuted = false;  // a fresh, valid packet clears any prior mute
 
-// --------------------- change_mode() ----------------------------
-void change_mode() {
-	
-	Serial.println("Change Mode");
-	
-// switch the spreading factor and mode flag
-// if the remote is in tilt/angle mode, it will remain in that
-// mode until the tilt mode time expires, the change back
-// to temperature mode cannot be commanded remotely
-	if(Tilt_flag) { // tilt mode
-		//restart LoRa transceiver module
-		LoRa.setPins(SS, RST, DIO0);
-		if(!LoRa.begin(BAND)) {
-			Serial.println("Starting LoRa failed!");
-			while (1); // halt here
-		}
-		LoRa.setSpreadingFactor(12); // temp mode	
-		Serial.println("Starting LoRa SF12 OK");
-		Tilt_flag = false ; // this starts temp mode
-	} else {
-	// command the remote to change to tilt mode
-	// *********************
-	// Send LoRa packet to receiver, still in SF12
-	// repeat 3 times to skirt the remote Tx on-period
-		LoRa.beginPacket();
-		LoRa.write(0xAB) ; // sync_byte, embedded by user
-		LoRa.write(0x05) ; // cmd_byte for the remote
-		LoRa.endPacket();  // send the change mode command
-		delay(400) ; 
-		LoRa.beginPacket();
-		LoRa.write(0xAB) ; // sync_byte, embedded by user
-		LoRa.write(0x05) ; // cmd_byte for the remote
-		LoRa.endPacket();  // send the change mode command
-		delay(400) ;
-		LoRa.beginPacket();
-		LoRa.write(0xAB) ; // sync_byte, embedded by user
-		LoRa.write(0x05) ; // cmd_byte for the remote
-		LoRa.endPacket();  // send the change mode command
-	// *******************
-		//restart LoRa transceiver module
-		LoRa.setPins(SS, RST, DIO0);
-		if(!LoRa.begin(BAND)) {
-			Serial.println("Starting LoRa failed!");
-			while (1); // halt here
-		}	
-		LoRa.setSpreadingFactor(9); // go to tilt mode
-		Serial.println("Starting LoRa SF-9 OK");
-		Tilt_flag = true ; // this starts the tilt mode
-		Tilt_clk = millis() ; // auto revert to temp mode clk
-	}
-/*	
-// dump any packet
-	while (LoRa.available()) {
-		sync_byte = LoRa.read(); //
-	}
-*/	
-// display the mode
-	display.clearDisplay();
-	display.setTextSize(3);
-	display.setCursor(0,15);
-	if(Tilt_flag) {
-		display.print("TILT") ;
-	} else {
-		display.print("Temp") ;
-	}
-	display.display(); 
-	delay(3000) ; // reading time
-	
-} // ---------------- end of change_mode() -------------------
+  digitalWrite(LED1_PIN, HIGH);
+  delay(30);
+  digitalWrite(LED1_PIN, LOW);
+}
 
-// -------------------------- Angles() ------------------------------
-void Angles() { // display trailer angles
+bool isLinkLost()
+{
+  return (lastPacketTime == 0) || (millis() - lastPacketTime > LINK_LOST_TIMEOUT_MS);
+}
 
-float xav ;
-float yav ;
-int xavI ;
-int yavI ;
-int bL ;
-int bH ;
+void updateAlertLED()
+{
+  digitalWrite(LED2_PIN, (isLinkLost() && !alertMuted) ? HIGH : LOW);
+}
 
-  //try to parse packet
-  packetSize = LoRa.parsePacket();
-  Serial.print("Tilt packet size = ") ;
-  Serial.println(packetSize) ;
-  if (packetSize > 3) {
-    //received a packet
-    Serial.print("Received packet ");
-    //read packet
-      bL = LoRa.read();   // low byte, angle in hundredths
-      bH = LoRa.read() ;  // high byte
-	  xavI = bH<<8|bL ;
-	  bL = LoRa.read();   // low byte, angle in hundredths
-      bH = LoRa.read() ;  // high byte
-	  yavI = bH<<8|bL ;
+// ---------------------------------------------------------------------------------
+//                                    Buttons
+// ---------------------------------------------------------------------------------
 
-	if(xavI>32000) xavI = xavI - 65536 ;
-	if(yavI>32000) yavI = yavI - 65536 ;
-	xav = xavI / 100.0 ;
-	yav = yavI / 100.0 ;
-	
-    //print RSSI of packet
-    int rssi = LoRa.packetRssi();
-    Serial.print(" with RSSI ");    
-    Serial.println(rssi);
+// Returns true once on the press transition (debounced), like the old
+// TestIO.ino pattern but table-driven for all 4 buttons.
+bool buttonPressed(DebouncedButton &b)
+{
+  bool isDown = (digitalRead(b.pin) == LOW);
+  bool justPressed = isDown && !b.wasDown;
+  b.wasDown = isDown;
+  return justPressed;
+}
 
-  // Display packet information
+void handleButtons()
+{
+  if (buttonPressed(buttons[0]))
+  {
+    currentScreen = (currentScreen + SCREEN_COUNT - 1) % SCREEN_COUNT;
+  }
+  if (buttonPressed(buttons[1]))
+  {
+    currentScreen = (currentScreen + 1) % SCREEN_COUNT;
+  }
+  if (buttonPressed(buttons[2]))
+  {
+    alertMuted = true;
+  }
+  if (buttonPressed(buttons[3]))
+  {
+    Serial.println("Button4 pressed (spare, no action assigned yet)");
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                                    Display
+// ---------------------------------------------------------------------------------
+
+void drawScreen()
+{
   display.clearDisplay();
-  display.setCursor(0,4);
-  if(!(yav < 0)) {
-		display.print("Up ");
-  } else {
-		display.print("Dn ") ;
-		yav = -yav ;
-  } 
-  if((abs(yav)<10)) display.print(" ");
-  display.print(yav, 1);
-  display.setCursor(0,40);
-  if(!(xav < 0)) {
-		display.print("R  ");
-  } else {
-		display.print("L  ") ;
-		xav = -xav ;
+  display.setCursor(0, 0);
+
+  switch (currentScreen)
+  {
+  case SCREEN_LEVEL:
+    display.println("Level");
+    display.print("Nose: ");
+    display.print(rxPacket.pitch, 1);
+    display.println();
+    display.print("Left: ");
+    display.print(rxPacket.roll, 1);
+    break;
+
+  case SCREEN_TEMPS:
+    display.println("Temps (F)");
+    display.print("Fridge  ");
+    display.println(rxPacket.temp1, 1);
+    display.print("Freezer ");
+    display.println(rxPacket.temp2, 1);
+    display.print("Inside  ");
+    display.println(rxPacket.temp3, 1);
+    display.print("DC Cab  ");
+    display.println(rxPacket.temp4, 1);
+    break;
+
+  case SCREEN_LINK:
+    display.println("LoRa Link");
+    if (lastPacketTime == 0)
+    {
+      display.println("No packet yet");
+    }
+    else
+    {
+      display.print("Last packet: ");
+      display.print((millis() - lastPacketTime) / 1000);
+      display.println("s ago");
+      display.println(isLinkLost() ? "LINK LOST" : "OK");
+    }
+    display.print("RSSI: ");
+    display.println(LoRa.packetRssi());
+    break;
   }
-  if((abs(xav)<10)) display.print(" ");
-  display.print(xav, 1);
+
   display.display();
-  }
-} // -------------------------- end of Angles() ----------------------
-
-// ----------------------- Temps() ------------------------------------
-void Temps() { // display the temperatures or door status
-
-byte t1L ;
-byte t1H ;
-byte t2L ;
-byte t2H ;
-int T_1 ;
-int T_2 ;
-
-// flash the onboard LED every 5 seconds
-	if(((millis() - loop_Time) > 5000)) {
-		digitalWrite(2, 1) ;
-		delay(200) ;
-		digitalWrite(2, 0) ;
-		loop_Time = millis() ;
-	}
-
-// parse packet
-	packetSize = LoRa.parsePacket();
-	if (packetSize) {
-		Serial.print("Temp packet size = ");
-		Serial.println(packetSize);
-	//read packet
-		sync_byte = LoRa.read(); // 
-		if(sync_byte == 0x69) {  // user sync byte
-			counter = LoRa.read();
-			t1L = LoRa.read();
-			t1H = LoRa.read();
-			t2L = LoRa.read();
-			t2H = LoRa.read();
-
-			T_1 = t1H<<8 | t1L ;
-			T_2 = t2H<<8 | t2L ;
-			// fix the 4-byte integer sign bit problem
-			if(T_1 > 20000) T_1 = T_1 - 65536 ;
-			if(T_2 > 20000) T_2 = T_2 - 65536 ;
-
-			//print RSSI of packet
-			int rssi = LoRa.packetRssi();
-			Serial.print(" with RSSI ");    
-			Serial.println(rssi);
-
-			if((T_1<12000) && (T_2<12000)) { // Less than +120
-				if((T_1>-3000) && (T_2>-3000)) { // > -30
-			// Display the packet message
-					display.clearDisplay();
-					display.setTextSize(1);
-					display.setCursor(0,0);
-					display.print("LORA Receiver: ");
-					display.println(counter) ;
-					display.setTextSize(3);
-					display.setCursor(0,15);
-					display.print(" ") ;
-					if(!(T_1<0)) {
-						if(T_1<10000) display.print(" ") ;
-						if(T_1<1000) display.print(" ") ;
-					} else {
-						if(abs(T_1)<1000) display.print(" ") ;
-					}
-					display.print(T_1/100.0, 1);   
-					display.setCursor(0,40);
-					display.print(" ") ;
-					if(!(T_2<0)) {
-						if(T_2<10000) display.print(" ") ;
-						if(T_2<1000) display.print(" ") ;
-					} else {
-						if(abs(T_2)<1000) display.print(" ") ;
-					}
-					display.print(T_2/100.0, 1); 
-					display.display(); 
-				}
-			}
-		} else {
-		// garbled packet: dump any remaing bytes
-			Serial.println("dumping");
-			while (LoRa.available()) {
-				sync_byte = LoRa.read();
-				Serial.println("dumping loop");
-			}
-		}
-	}
 }
