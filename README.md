@@ -55,19 +55,41 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
 - Temp probes are BOJACK DS18B20 (1M stainless, OneWire) -- one per pin, each with its own
   bus and pull-up resistor (the schematic's 3.3k), not a shared bus.
 
-## Known toolchain issue: Heltec ESP32 Dev-Boards v2.1.7 fails to compile on GCC 14
+## Known bugs in Heltec ESP32 Dev-Boards v2.1.7 (needed for Tilt_Temp_TowVehc)
 
-`libraries/Heltec_ESP32_Dev-Boards/src/driver/sx1276.c` calls `SpiInOut()` without a
-prototype in scope (the equivalent `sx1262-board.c` has one; `sx1276.c` is just missing
-it upstream). Older GCC only warned about this; GCC 14 (the toolchain Heltec's ESP32 core
-3.3.8 board package ships) makes it a hard error by default, so `Tilt_Temp_TowVehc` won't
-compile against a fresh install of this library without a one-line fix.
+Two real upstream bugs in this library needed local patches to work with this project's
+toolchain (GCC 14, from Heltec's ESP32 core 3.3.8 board package) and board (WiFi LoRa 32 V2).
 
 **This library is gitignored** (Library Manager installs aren't tracked in this repo), so
-the fix below needs to be reapplied any time the library is freshly installed/updated:
+both fixes below need to be reapplied any time the library is freshly installed/updated.
+
+### 1. Compile error: `SpiInOut` implicit declaration
+
+`src/driver/sx1276.c` calls `SpiInOut()` without a prototype in scope (the equivalent
+`sx1262-board.c` has one; `sx1276.c` is just missing it upstream). Older GCC only warned
+about this; GCC 14 makes it a hard error by default.
 
 Add this line near the top of `sx1276.c` (after the existing `extern void lora_printf(...)`
 declaration works as a landmark):
 ```c
 extern uint8_t SpiInOut(Spi_t *obj, uint8_t outData);
+```
+
+### 2. Crash on `Heltec.begin()`: null-pointer dereference in `display->init()`
+
+`src/heltec.h` defines the macro `Class_WIFI_LORA` (all-caps LORA) for WiFi LoRa 32 boards,
+but `src/heltec.cpp`'s `Heltec_ESP32` constructor checks for a differently-cased
+`Class_Wifi_LoRa` -- which is never actually defined, since preprocessor macros are
+case-sensitive. That means `display` (the `SSD1306Wire*`) is never allocated, while
+`Heltec_Screen` (which gates whether `begin()` calls `display->init()`) correctly checks
+`Class_WIFI_LORA` and does fire -- calling `init()` through a null pointer, crashing with
+`EXCVADDR: 0x00000014` (Guru Meditation, LoadProhibited).
+
+In `heltec.cpp`, change the constructor's `#if` from:
+```c
+#if defined( Class_Wifi_Kit ) || defined( Class_Wifi_LoRa )
+```
+to:
+```c
+#if defined( Class_Wifi_Kit ) || defined( Class_WIFI_LORA )
 ```
