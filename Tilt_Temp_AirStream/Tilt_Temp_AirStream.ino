@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 09:32 PDT
+// Last updated: 2026-07-25 09:43 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt and 4 DS18B20 (OneWire) temp
@@ -466,10 +466,13 @@ void drawValueField(int lineIndex, const char *text)
 
 void drawInfoScreenValues()
 {
-  char buf[24];
+  char buf[32];
   const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
 
-  snprintf(buf, sizeof(buf), "%.1f %s", txPacket.pitch, unit);
+  // TEMPORARY DIAGNOSTIC: append uptime seconds, which must visibly tick
+  // every second regardless of sensor values -- proves whether this
+  // function is actually running/redrawing at all.
+  snprintf(buf, sizeof(buf), "%.1f %s (%lus)", txPacket.pitch, unit, millis() / 1000);
   drawValueField(0, buf);
 
   snprintf(buf, sizeof(buf), "%.1f %s", txPacket.roll, unit);
