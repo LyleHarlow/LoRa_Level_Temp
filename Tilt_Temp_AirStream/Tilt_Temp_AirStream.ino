@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 07:37 PDT
+// Last updated: 2026-07-26 08:09 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -343,10 +343,14 @@ void setupRTC()
 
   if (!rtc.initialized() || rtc.lostPower())
   {
-    // First boot, or the battery was disconnected/died -- fall back to
-    // this sketch's compile time. Not accurate, but better than nothing;
-    // the Settings screen can set a real time.
+    // lostPower() being true on every boot (time set via the Settings
+    // screen works, but doesn't survive a power cycle) almost always means
+    // the PCF8523 module's CR1220 backup battery is missing, dead, or not
+    // seated -- the RTC has no way to keep time with main power removed.
+    // Falls back to this sketch's compile time either way (not accurate,
+    // but better than nothing).
     Serial.println("RTC lost power or uninitialized -- setting to compile time");
+    Serial.println("  (if this happens every boot even after setting the time, check the RTC module's CR1220 battery)");
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
 
@@ -737,57 +741,78 @@ void commandTemps(void)
 //                           Screen 3: Fan Control
 // ---------------------------------------------------------------------------------
 
+// NOTE on SELECTION_BOX.width: it's the TOTAL width, split evenly across
+// all choice cells ((width-3)/numberOfCells per cell, see
+// getCoordsOfSelectionBoxCell() in the library) -- NOT the width of one
+// cell. A 4-choice box needs real screen width to stay legible, which is
+// why Probe gets its own full-width row below rather than sharing a
+// 2-column layout with the other 5 widgets.
+//
+// Also: unused choice slots must be "" (empty string), not NULL --
+// countSelectionBoxChoices() checks choice2Text[0]/choice3Text[0], which
+// is a null-pointer dereference if those are NULL instead of "".
 SELECTION_BOX fanProbeBox = {"Probe", 0, "Fridge", "Freezer", "Inside AS", "DC Cabinet", 0, 0, 0, 0};
-SELECTION_BOX fanScheduleBox = {"Schedule", 0, "Disabled", "Enabled", NULL, NULL, 0, 0, 0, 0};
+SELECTION_BOX fanScheduleBox = {"Schedule", 0, "Disabled", "Enabled", "", "", 0, 0, 0, 0};
 NUMBER_BOX_FLOAT fanMinTempBox = {"Min Temp", 70.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
 NUMBER_BOX_FLOAT fanMaxTempBox = {"Max Temp", 90.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
 NUMBER_BOX fanStartHourBox = {"Start Hr", 8, 0, 23, 1, 0, 0, 0, 0};
 NUMBER_BOX fanEndHourBox = {"End Hr", 20, 0, 23, 1, 0, 0, 0, 0};
 
-// Positions all 6 widgets in a 2-column x 3-row grid sized from the
-// display's actual bounds, rather than hardcoded pixel guesses.
+// 4 rows: Probe (full width, needs room for 4 text choices), Schedule
+// (full width), then Min/Max Temp and Start/End Hour as 2-column rows
+// (NUMBER_BOX degrades gracefully at narrower widths, unlike SELECTION_BOX).
 void layoutFanControlWidgets()
 {
+  // drawSelectionBox()/drawNumberBox() draw the label ABOVE the box itself
+  // (see TouchUserInterfaceForArduino.cpp), so each row needs headroom
+  // reserved for that label, not just the box height -- query the actual
+  // font metrics rather than guessing a fixed pixel value.
+  int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
+  int rowHeight = ui.displaySpaceHeight / 4;
+  int rowWidgetHeight = rowHeight - labelSpace - 6;  // 6px gap before the next row
+
+  int fullWidth = ui.displaySpaceWidth - 20;
+  int fullCenterX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
+
   int colWidth = ui.displaySpaceWidth / 2;
-  int rowHeight = ui.displaySpaceHeight / 3;
   int leftX = ui.displaySpaceLeftX + colWidth / 2;
   int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
-  int widgetWidth = colWidth - 20;
-  int widgetHeight = rowHeight - 16;
+  int halfWidth = colWidth - 20;
 
-  int row1Y = ui.displaySpaceTopY + rowHeight / 2;
-  int row2Y = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
-  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
+  int row1Y = ui.displaySpaceTopY + labelSpace + rowWidgetHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + rowWidgetHeight / 2;
+  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + labelSpace + rowWidgetHeight / 2;
+  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + labelSpace + rowWidgetHeight / 2;
 
-  fanProbeBox.centerX = leftX;
+  fanProbeBox.centerX = fullCenterX;
   fanProbeBox.centerY = row1Y;
-  fanProbeBox.width = widgetWidth;
-  fanProbeBox.height = widgetHeight;
+  fanProbeBox.width = fullWidth;
+  fanProbeBox.height = rowWidgetHeight;
 
-  fanScheduleBox.centerX = rightX;
-  fanScheduleBox.centerY = row1Y;
-  fanScheduleBox.width = widgetWidth;
-  fanScheduleBox.height = widgetHeight;
+  fanScheduleBox.centerX = fullCenterX;
+  fanScheduleBox.centerY = row2Y;
+  fanScheduleBox.width = fullWidth;
+  fanScheduleBox.height = rowWidgetHeight;
 
   fanMinTempBox.centerX = leftX;
-  fanMinTempBox.centerY = row2Y;
-  fanMinTempBox.width = widgetWidth;
-  fanMinTempBox.height = widgetHeight;
+  fanMinTempBox.centerY = row3Y;
+  fanMinTempBox.width = halfWidth;
+  fanMinTempBox.height = rowWidgetHeight;
 
-  fanStartHourBox.centerX = rightX;
-  fanStartHourBox.centerY = row2Y;
-  fanStartHourBox.width = widgetWidth;
-  fanStartHourBox.height = widgetHeight;
-
-  fanMaxTempBox.centerX = leftX;
+  fanMaxTempBox.centerX = rightX;
   fanMaxTempBox.centerY = row3Y;
-  fanMaxTempBox.width = widgetWidth;
-  fanMaxTempBox.height = widgetHeight;
+  fanMaxTempBox.width = halfWidth;
+  fanMaxTempBox.height = rowWidgetHeight;
+
+  fanStartHourBox.centerX = leftX;
+  fanStartHourBox.centerY = row4Y;
+  fanStartHourBox.width = halfWidth;
+  fanStartHourBox.height = rowWidgetHeight;
 
   fanEndHourBox.centerX = rightX;
-  fanEndHourBox.centerY = row3Y;
-  fanEndHourBox.width = widgetWidth;
-  fanEndHourBox.height = widgetHeight;
+  fanEndHourBox.centerY = row4Y;
+  fanEndHourBox.width = halfWidth;
+  fanEndHourBox.height = rowWidgetHeight;
 }
 
 void drawFanControlTitleBar()
@@ -883,19 +908,24 @@ BUTTON saveTimeButton = {"Save Time", 0, 0, 0, 0};
 BUTTON zeroLevelButton = {"Zero Level", 0, 0, 0, 0};
 
 // 2-column x 4-row grid: Year/Month, Day/Hour, Minute/(empty), Save Time/Zero Level.
+// NUMBER_BOX draws its label above the box (BUTTON draws its label inside),
+// so headroom is reserved for every row for simplicity -- harmless extra
+// gap above the row 4 buttons, but avoids the rows 1-3 label/box overlap
+// this exact mistake caused on the Fan Control screen.
 void layoutSettingsWidgets()
 {
+  int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
   int colWidth = ui.displaySpaceWidth / 2;
   int rowHeight = ui.displaySpaceHeight / 4;
   int leftX = ui.displaySpaceLeftX + colWidth / 2;
   int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
   int widgetWidth = colWidth - 20;
-  int widgetHeight = rowHeight - 14;
+  int widgetHeight = rowHeight - labelSpace - 6;
 
-  int row1Y = ui.displaySpaceTopY + rowHeight / 2;
-  int row2Y = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
-  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
-  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + rowHeight / 2;
+  int row1Y = ui.displaySpaceTopY + labelSpace + widgetHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + widgetHeight / 2;
+  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + labelSpace + widgetHeight / 2;
+  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + labelSpace + widgetHeight / 2;
 
   yearBox.centerX = leftX;
   yearBox.centerY = row1Y;
