@@ -41,6 +41,26 @@ note in `Tilt_Temp_AirStream.ino`, before trusting the tilt readings).
    repo's root, since Arduino IDE also looks in `<sketchbook>/libraries/`).
    Source: https://github.com/Stan-Reifel/TouchUserInterfaceForArduino
 
+## Test-compiling without the Arduino IDE
+
+Arduino IDE 2.x bundles its own `arduino-cli` at
+`C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`, and
+already has a config file at `C:\Users\Harlow\.arduinoIDE\arduino-cli.yaml` with
+`directories.user` pointed at this repo's root (same sketchbook location the IDE itself
+uses) -- so it sees the same board packages and `libraries/` folder with no extra setup.
+Compile either sketch with:
+```
+"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" ^
+  --config-file "C:\Users\Harlow\.arduinoIDE\arduino-cli.yaml" ^
+  compile --fqbn Heltec-esp32:esp32:heltec_wifi_lora_32_V2 ^
+  "Tilt_Temp_AirStream"
+```
+(swap the sketch folder for `Tilt_Temp_TowVehc`, `AxisOrientationTest`, or `LCDTest`). First
+compile builds the whole ESP32 core and takes a few minutes; subsequent ones are much
+faster. A standalone `arduino-cli` downloaded fresh (e.g. to a temp folder) may get blocked
+by Windows Application Control policy -- the IDE's own bundled copy runs fine since it's
+already an installed, trusted binary.
+
 ## Known hardware notes
 
 - MPU6050 address is 0x69 (ADO jumpered to 3.3V) so it doesn't collide with the PCF8523
