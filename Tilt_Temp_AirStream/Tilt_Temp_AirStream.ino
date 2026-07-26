@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 09:17 PDT
+// Last updated: 2026-07-26 14:05 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -29,6 +29,8 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <EEPROM.h>
+#include <nvs_flash.h>
+#include <nvs.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <RTClib.h>
@@ -225,6 +227,62 @@ void setup()
   Serial.println();
   Serial.println(this_file);
   Serial.println(ver);
+
+  // NVS recovery: EEPROM.begin() below reads through esp-idf's NVS layer.
+  // A crash here (LoadProhibited inside nvs_get_blob/Item::Item, seen even
+  // after a full flash erase) means the NVS partition itself came up
+  // corrupt/mismatched -- the Arduino core's automatic nvs_flash_init() at
+  // boot doesn't self-heal from that, it just leaves it broken. Detect and
+  // force-erase+reinit here so EEPROM.begin() always sees a clean partition.
+  esp_err_t nvsErr = nvs_flash_init();
+  if (nvsErr == ESP_ERR_NVS_NO_FREE_PAGES || nvsErr == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
+    Serial.println("NVS partition corrupt/mismatched -- erasing and reinitializing");
+    nvs_flash_erase();
+    nvsErr = nvs_flash_init();
+  }
+  if (nvsErr != ESP_OK)
+  {
+    Serial.print("nvs_flash_init() failed, err=");
+    Serial.println(nvsErr);
+  }
+
+  // Work around a crash in this core's EEPROM library (esp32 3.3.8): when the
+  // "eeprom" NVS blob doesn't exist AT ALL yet (key_size == 0), begin()'s
+  // "brand new" path -- write a throwaway "expand" key, erase it, write the
+  // real "eeprom" blob, then immediately read it back -- crashes at that
+  // read-back (EEPROM.cpp:117, nvs_get_blob -> Item::Item -> strncpy) with
+  // LoadProhibited. Reproduced even after a full chip erase, so it's not
+  // stale data -- it's this specific from-scratch path. Resizing a blob that
+  // ALREADY exists (grow or shrink) goes through a different, confirmed-safe
+  // path -- e.g. TouchUserInterfaceForArduino's own writeConfigurationFloat/
+  // Int calls EEPROM.begin(1024) internally (its own hardcoded size, see
+  // TouchUserInterfaceForArduino.cpp EEPROM_SIZE), silently regrowing this
+  // same blob from 128 to 1024 bytes the first time any config is saved.
+  // So only pre-create the blob when it's truly absent -- never touch it
+  // (and never wipe it) if it already exists at some other size, or the
+  // library's own resize on the NEXT boot would look like a fresh key again
+  // and get wiped here, discarding whatever was saved (this bit us: Zero
+  // Level calibration wasn't surviving a power cycle because of exactly
+  // this).
+  {
+    nvs_handle_t rawHandle;
+    if (nvs_open("eeprom", NVS_READWRITE, &rawHandle) == ESP_OK)
+    {
+      size_t existingSize = 0;
+      esp_err_t sizeErr = nvs_get_blob(rawHandle, "eeprom", NULL, &existingSize);
+      if (sizeErr == ESP_ERR_NVS_NOT_FOUND)
+      {
+        uint8_t blank[128];
+        memset(blank, 0xFF, sizeof(blank));
+        esp_err_t setErr = nvs_set_blob(rawHandle, "eeprom", blank, sizeof(blank));
+        nvs_commit(rawHandle);
+        Serial.print("eeprom NVS blob didn't exist -- created at 128 bytes, err=");
+        Serial.println(setErr);
+      }
+      nvs_close(rawHandle);
+    }
+  }
 
   // ESP32's EEPROM library is flash-backed and requires begin() before use --
   // the UI library's writeConfigurationFloat/Int/readConfigurationFloat/Int
@@ -443,6 +501,28 @@ void setupTempSensors()
   dsTemp2.setWaitForConversion(false);
   dsTemp3.setWaitForConversion(false);
   dsTemp4.setWaitForConversion(false);
+}
+
+// TouchUserInterfaceForArduino's ESP32 writeConfigurationInt/Float
+// (TouchUserInterfaceForArduino.cpp, #if !defined(ARDUINO_ARCH_RP2040))
+// call EEPROM.write() per byte but -- unlike the RP2040 branch of the same
+// functions -- never call EEPROM.commit(). That means a "saved" value only
+// ever reaches EEPROM's in-RAM buffer; it's never pushed to nvs_set_blob()
+// at all, let alone made durable. This is why Zero Level and fan settings
+// weren't sticking across a power cycle. Call EEPROM.commit() ourselves to
+// actually stage the write, then nvs_commit() directly for good measure
+// (nvs_set_blob() alone isn't documented as durable until nvs_commit() is
+// called -- see esp-idf's nvs.h). Call this once after any
+// ui.writeConfigurationInt/Float call.
+void flushEepromToFlash()
+{
+  EEPROM.commit();
+  nvs_handle_t h;
+  if (nvs_open("eeprom", NVS_READWRITE, &h) == ESP_OK)
+  {
+    nvs_commit(h);
+    nvs_close(h);
+  }
 }
 
 void loadFanSettings()
@@ -925,31 +1005,37 @@ void commandFanControl(void)
     {
       fanProbeIndex = fanProbeBox.value;
       ui.writeConfigurationInt(EEPROM_ADDR_FAN_PROBE, fanProbeIndex);
+      flushEepromToFlash();
     }
     if (ui.checkForSelectionBoxTouched(fanScheduleBox))
     {
       fanTimeEnabled = fanScheduleBox.value;
       ui.writeConfigurationInt(EEPROM_ADDR_FAN_TIME_ENABLE, fanTimeEnabled);
+      flushEepromToFlash();
     }
     if (ui.checkForNumberBoxTouched(fanMinTempBox))
     {
       fanMinTemp = fanMinTempBox.value;
       ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MIN_TEMP, fanMinTemp);
+      flushEepromToFlash();
     }
     if (ui.checkForNumberBoxTouched(fanMaxTempBox))
     {
       fanMaxTemp = fanMaxTempBox.value;
       ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MAX_TEMP, fanMaxTemp);
+      flushEepromToFlash();
     }
     if (ui.checkForNumberBoxTouched(fanStartHourBox))
     {
       fanStartHour = fanStartHourBox.value;
       ui.writeConfigurationInt(EEPROM_ADDR_FAN_START_HOUR, fanStartHour);
+      flushEepromToFlash();
     }
     if (ui.checkForNumberBoxTouched(fanEndHourBox))
     {
       fanEndHour = fanEndHourBox.value;
       ui.writeConfigurationInt(EEPROM_ADDR_FAN_END_HOUR, fanEndHour);
+      flushEepromToFlash();
     }
 
     // Relay state can change purely from temperature drifting (not just
@@ -1082,6 +1168,7 @@ void commandSettings(void)
       rollOffset += txPacket.roll;
       ui.writeConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, pitchOffset);
       ui.writeConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, rollOffset);
+      flushEepromToFlash();
     }
 
     delay(50);
