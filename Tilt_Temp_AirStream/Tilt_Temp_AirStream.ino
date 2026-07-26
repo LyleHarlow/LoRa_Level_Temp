@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 08:53 PDT
+// Last updated: 2026-07-26 09:17 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -143,6 +143,7 @@ const unsigned long TEMP_CONVERSION_TIME_MS = 750;
 // ---------------------------------------------------------------------------------
 
 Adafruit_MPU6050 mpu;
+bool mpuAvailable = false;
 RTC_PCF8523 rtc;
 bool rtcAvailable = false;
 TouchUserInterfaceForArduino ui;
@@ -311,33 +312,67 @@ void setup()
   }
 }
 
+// Prints every I2C address that ACKs, or "(nothing responded)" if none do.
+// Diagnostic for the cold-power-cycle MPU6050 init failures -- shows
+// directly whether NOTHING is on the bus yet (bus-wide power/pull-up
+// issue) or whether e.g. the RTC (fixed 0x68) responds while the MPU6050
+// (0x69, which depends on the ADO jumper reading a stable HIGH) doesn't.
+void scanI2CBus()
+{
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++)
+  {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0)
+    {
+      Serial.print("  I2C device responding at 0x");
+      Serial.println(addr, HEX);
+      found++;
+    }
+  }
+  if (found == 0)
+  {
+    Serial.println("  I2C scan: nothing responded");
+  }
+}
+
 void setupTiltSensor()
 {
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  // On a true power cycle (unlike a USB-triggered reset/reflash, where the
-  // board's own power rails never actually drop -- only the ESP32 CPU
-  // resets), the MPU6050 needs a brief settling time after power-up
-  // before it reliably ACKs on I2C. A single immediate mpu.begin() call
-  // can fail right after cold power-on; if it fails, the old code just
-  // logged a warning and kept going with a never-initialized sensor
-  // object, which then reads back stuck/frozen values forever -- exactly
-  // "Level resets and never updates after a power cycle, but works fine
-  // after reflashing" (reflash doesn't fully power-cycle the board).
-  // Retry for up to ~1s rather than giving up on the first attempt.
-  const int MPU_INIT_MAX_ATTEMPTS = 5;
+  // mpu.begin() was found to fail on EVERY attempt within a ~1s retry
+  // window after a true power cycle (not just the first one or two),
+  // which rules out "just needs a brief settling delay" as the whole
+  // story -- works fine after a USB reflash (board power never actually
+  // drops during that), fails every time after a real power-off/on.
+  // Extended the retry window further and added I2C bus scans along the
+  // way to see directly what's actually responding during a failed cold
+  // boot, rather than guessing blindly again.
+  const int MPU_INIT_MAX_ATTEMPTS = 15;
+  const unsigned long MPU_INIT_RETRY_DELAY_MS = 300;
   bool mpuOk = false;
+
   for (int attempt = 1; attempt <= MPU_INIT_MAX_ATTEMPTS && !mpuOk; attempt++)
   {
+    if (attempt == 1 || attempt % 5 == 0)
+    {
+      Serial.print("I2C scan at MPU6050 init attempt ");
+      Serial.print(attempt);
+      Serial.println(":");
+      scanI2CBus();
+    }
+
     mpuOk = mpu.begin(MPU6050_ADDRESS, &Wire);
     if (!mpuOk)
     {
       Serial.print("MPU6050 init attempt ");
       Serial.print(attempt);
       Serial.println(" failed, retrying...");
-      delay(200);
+      delay(MPU_INIT_RETRY_DELAY_MS);
     }
   }
+
+  mpuAvailable = mpuOk;
 
   if (!mpuOk)
   {
@@ -439,6 +474,17 @@ void loop()
 
 void updateTilt()
 {
+  // Make a never-initialized sensor obvious (NAN, same pattern as a
+  // disconnected DS18B20 probe) rather than silently displaying whatever
+  // getEvent() happens to return from an object that never successfully
+  // began -- previously this looked like a plausible but frozen reading.
+  if (!mpuAvailable)
+  {
+    txPacket.pitch = NAN;
+    txPacket.roll = NAN;
+    return;
+  }
+
   sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
