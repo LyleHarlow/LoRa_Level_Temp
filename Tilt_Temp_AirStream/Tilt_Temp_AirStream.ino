@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 07:28 PDT
+// Last updated: 2026-07-26 07:37 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -196,6 +196,14 @@ bool fanOn = false;
 // ---------------------------------------------------------------------------------
 
 extern MENU_ITEM mainMenu[];
+
+// Arduino's auto-prototype generation doesn't pick these up when they're
+// only referenced inside the menu table initializer below -- forward
+// declared explicitly instead.
+void commandLevel(void);
+void commandTemps(void);
+void commandFanControl(void);
+void commandSettings(void);
 
 MENU_ITEM mainMenu[] = {
     {MENU_ITEM_TYPE_MAIN_MENU_HEADER, "Airstream Monitor", MENU_COLUMNS_2, mainMenu},
