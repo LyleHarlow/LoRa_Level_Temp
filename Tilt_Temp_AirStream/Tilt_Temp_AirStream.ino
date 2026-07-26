@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 08:09 PDT
+// Last updated: 2026-07-26 08:53 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -315,9 +315,33 @@ void setupTiltSensor()
 {
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  if (!mpu.begin(MPU6050_ADDRESS, &Wire))
+  // On a true power cycle (unlike a USB-triggered reset/reflash, where the
+  // board's own power rails never actually drop -- only the ESP32 CPU
+  // resets), the MPU6050 needs a brief settling time after power-up
+  // before it reliably ACKs on I2C. A single immediate mpu.begin() call
+  // can fail right after cold power-on; if it fails, the old code just
+  // logged a warning and kept going with a never-initialized sensor
+  // object, which then reads back stuck/frozen values forever -- exactly
+  // "Level resets and never updates after a power cycle, but works fine
+  // after reflashing" (reflash doesn't fully power-cycle the board).
+  // Retry for up to ~1s rather than giving up on the first attempt.
+  const int MPU_INIT_MAX_ATTEMPTS = 5;
+  bool mpuOk = false;
+  for (int attempt = 1; attempt <= MPU_INIT_MAX_ATTEMPTS && !mpuOk; attempt++)
   {
-    Serial.println("MPU6050 not found at 0x69 -- check the ADO jumper and wiring");
+    mpuOk = mpu.begin(MPU6050_ADDRESS, &Wire);
+    if (!mpuOk)
+    {
+      Serial.print("MPU6050 init attempt ");
+      Serial.print(attempt);
+      Serial.println(" failed, retrying...");
+      delay(200);
+    }
+  }
+
+  if (!mpuOk)
+  {
+    Serial.println("MPU6050 not found at 0x69 after retries -- check the ADO jumper and wiring");
   }
 
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
