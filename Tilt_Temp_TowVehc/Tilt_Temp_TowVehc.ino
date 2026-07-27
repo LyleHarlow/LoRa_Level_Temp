@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-25 10:52 PDT
+// Last updated: 2026-07-26 19:20 PDT
 
 //
 // Heltec WiFi LoRa 32 V2, built on Heltec's own board package + Heltec_ESP32
@@ -65,9 +65,13 @@ enum Screen
   SCREEN_LEVEL = 0,
   SCREEN_TEMPS = 1,
   SCREEN_LINK = 2,
-  SCREEN_COUNT = 3
+  SCREEN_FAN = 3,
+  SCREEN_COUNT = 4
 };
 int currentScreen = SCREEN_LEVEL;
+
+// Matches Airstream's Fan Control probe order (EEPROM_ADDR_FAN_PROBE).
+const char *FAN_PROBE_NAMES[4] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet"};
 
 // simple debounce: pin, and whether it was down last time we checked
 struct DebouncedButton
@@ -244,6 +248,17 @@ void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *
   snprintf(buf, bufSize, "%s %.1f deg", direction, magnitude);
 }
 
+// Compact "8AM"/"11PM"-style hour, matching the Airstream's 12-hour Set
+// Time/Schedule Fan Control screens -- this tiny 128x64 OLED doesn't have
+// room for a full "8:00 AM".
+void formatHour12Compact(char *buf, size_t bufSize, int hour24)
+{
+  int hour12 = hour24 % 12;
+  if (hour12 == 0)
+    hour12 = 12;
+  snprintf(buf, bufSize, "%d%s", hour12, (hour24 >= 12) ? "PM" : "AM");
+}
+
 void drawScreen()
 {
   Heltec.display->clear();
@@ -255,11 +270,17 @@ void drawScreen()
   switch (currentScreen)
   {
   case SCREEN_LEVEL:
-    Heltec.display->drawString(0, 0, "Level");
+    // Label above value (rather than side-by-side, which doesn't fit this
+    // 128px-wide screen at a readable size) -- matches the Airstream's own
+    // "Front/Back"/"Left/Right" row labels and roll wording (the low side
+    // needs a shim, so that's the side named). No date/time here -- this
+    // screen is hard enough to read already without extra clutter.
+    Heltec.display->drawString(0, 0, "Front/Back");
     formatDirectionalValue(line, sizeof(line), rxPacket.pitch, "Nose High", "Nose Low");
-    Heltec.display->drawString(0, 20, line);
-    formatDirectionalValue(line, sizeof(line), rxPacket.roll, "Left High", "Right High");
-    Heltec.display->drawString(0, 40, line);
+    Heltec.display->drawString(0, 13, line);
+    Heltec.display->drawString(0, 32, "Left/Right");
+    formatDirectionalValue(line, sizeof(line), rxPacket.roll, "Right Low", "Left Low");
+    Heltec.display->drawString(0, 45, line);
     break;
 
   case SCREEN_TEMPS:
@@ -276,19 +297,48 @@ void drawScreen()
 
   case SCREEN_LINK:
     Heltec.display->drawString(0, 0, "LoRa Link");
+    if (rxPacket.year == 0)
+    {
+      Heltec.display->drawString(0, 13, "No RTC data");
+    }
+    else
+    {
+      snprintf(line, sizeof(line), "%d/%d/%d %d:%02d%s", rxPacket.month, rxPacket.day, rxPacket.year,
+        (rxPacket.hour % 12 == 0) ? 12 : rxPacket.hour % 12, rxPacket.minute, (rxPacket.hour >= 12) ? "PM" : "AM");
+      Heltec.display->drawString(0, 13, line);
+    }
     if (lastPacketTime == 0)
     {
-      Heltec.display->drawString(0, 16, "No packet yet");
+      Heltec.display->drawString(0, 26, "No packet yet");
     }
     else
     {
       snprintf(line, sizeof(line), "Last: %lus ago", (millis() - lastPacketTime) / 1000);
-      Heltec.display->drawString(0, 16, line);
-      Heltec.display->drawString(0, 29, isLinkLost() ? "LINK LOST" : "OK");
+      Heltec.display->drawString(0, 26, line);
+      Heltec.display->drawString(0, 39, isLinkLost() ? "LINK LOST" : "OK");
     }
     snprintf(line, sizeof(line), "RSSI: %d", Heltec.LoRa.packetRssi());
-    Heltec.display->drawString(0, 42, line);
+    Heltec.display->drawString(0, 52, line);
     break;
+
+  case SCREEN_FAN:
+  {
+    Heltec.display->drawString(0, 0, "Fan Control");
+    Heltec.display->drawString(0, 13, rxPacket.fanOn ? "Fan: ON" : "Fan: OFF");
+    int probeIndex = rxPacket.fanProbeIndex;
+    if (probeIndex < 0 || probeIndex > 3)
+      probeIndex = 0;
+    snprintf(line, sizeof(line), "Probe: %s", FAN_PROBE_NAMES[probeIndex]);
+    Heltec.display->drawString(0, 26, line);
+    snprintf(line, sizeof(line), "Off:%.0f  On:%.0f", rxPacket.fanOffTemp, rxPacket.fanOnTemp);
+    Heltec.display->drawString(0, 39, line);
+    char startBuf[8], endBuf[8];
+    formatHour12Compact(startBuf, sizeof(startBuf), rxPacket.fanStartHour);
+    formatHour12Compact(endBuf, sizeof(endBuf), rxPacket.fanEndHour);
+    snprintf(line, sizeof(line), "Sched: %s-%s", startBuf, endBuf);
+    Heltec.display->drawString(0, 52, line);
+    break;
+  }
   }
 
   Heltec.display->display();

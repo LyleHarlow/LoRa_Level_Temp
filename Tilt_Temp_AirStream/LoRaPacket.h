@@ -14,6 +14,23 @@ struct LoRaPacket
   float temp2;  // Freezer, deg F
   float temp3;  // Inside Airstream, deg F
   float temp4;  // DC Electrical Cabinet (battery bank + inverter), deg F
+
+  // RTC date/time from the Airstream board -- all 0 if its RTC isn't
+  // available. hour is 24-hour; TowVehicle converts to 12-hour+AM/PM for
+  // display, matching the Airstream's own Set Time screen.
+  int year;
+  int month;
+  int day;
+  int hour;
+  int minute;
+
+  // Fan control status, mirrors the Airstream's Fan Control screens.
+  int fanOn;          // 0/1
+  int fanProbeIndex;  // 0=Fridge, 1=Freezer, 2=Inside AS, 3=DC Cabinet
+  float fanOffTemp;   // deg F -- fan turns off at/below this
+  float fanOnTemp;    // deg F -- fan turns on at/above this
+  int fanStartHour;   // 24-hour
+  int fanEndHour;     // 24-hour
 };
 
 #endif

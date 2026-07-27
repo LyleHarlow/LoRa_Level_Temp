@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 18:45 PDT
+// Last updated: 2026-07-26 19:10 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -795,6 +795,34 @@ void transmitPacket()
   // than the original single-screen UI. endPacket(true) is async -- it
   // starts the transmission and returns immediately; the radio finishes it
   // in the background well within the 2-second gap before the next call.
+  // Fill in the date/time and fan status fields right before sending --
+  // pitch/roll/temp1-4 are already kept current by updateTilt()/
+  // updateTemperatures() every loop iteration, but these don't have a
+  // dedicated "owner" function, so gather them here instead.
+  if (rtcAvailable)
+  {
+    DateTime now = rtc.now();
+    txPacket.year = now.year();
+    txPacket.month = now.month();
+    txPacket.day = now.day();
+    txPacket.hour = now.hour();
+    txPacket.minute = now.minute();
+  }
+  else
+  {
+    txPacket.year = 0;
+    txPacket.month = 0;
+    txPacket.day = 0;
+    txPacket.hour = 0;
+    txPacket.minute = 0;
+  }
+  txPacket.fanOn = fanOn ? 1 : 0;
+  txPacket.fanProbeIndex = fanProbeIndex;
+  txPacket.fanOffTemp = fanMinTemp;
+  txPacket.fanOnTemp = fanMaxTemp;
+  txPacket.fanStartHour = fanStartHour;
+  txPacket.fanEndHour = fanEndHour;
+
   LoRa.beginPacket();
   LoRa.write((uint8_t *)&txPacket, sizeof(txPacket));
   LoRa.endPacket(true);
