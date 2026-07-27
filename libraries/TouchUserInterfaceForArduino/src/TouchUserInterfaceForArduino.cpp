@@ -222,7 +222,12 @@ XPT2046_Touchscreen *ts;
 //
 // the size of features for drawing the user interface
 //
-const int titleBarHeight = 34;
+// Bumped from 34 -- the stock back button (height = titleBarHeight - 6) was
+// too small to reliably tap on the Airstream board's touchscreen. This is a
+// vendored copy in-repo (libraries/TouchUserInterfaceForArduino), tracked by
+// git, so patching it directly is safe -- but re-apply this change if the
+// library is ever re-vendored from upstream.
+const int titleBarHeight = 46;
 const int arrowWidth = 8;
 
 

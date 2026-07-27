@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 14:05 PDT
+// Last updated: 2026-07-26 18:45 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -394,9 +394,53 @@ void scanI2CBus()
   }
 }
 
+// If a previous I2C transaction was interrupted mid-stream (e.g. by the
+// known esp32 core 3.3.8 I2C driver crash -- espressif/arduino-esp32#11374,
+// hit in this project during first-read-after-boot MPU6050 access), a
+// slave device can be left holding SDA low, waiting for clock pulses it'll
+// never get. That wedges the bus for every future transaction --
+// Wire.begin() only resets the ESP32's own I2C peripheral, not an external
+// device still holding the line, which is why recovering from that crash
+// previously required physically power-cycling the RTC/MPU6050 and why a
+// second boot attempt right after a crash hung identically instead of
+// retrying cleanly. Manually pulse SCL as a plain GPIO before Wire claims
+// the pins -- the standard software recovery for a stuck I2C slave -- then
+// issue a manual STOP condition, so the crash's own auto-reboot has an
+// actual chance to succeed instead of needing physical intervention.
+void recoverStuckI2CBus()
+{
+  pinMode(SCL_PIN, OUTPUT);
+  pinMode(SDA_PIN, INPUT_PULLUP);
+
+  for (int i = 0; i < 9; i++)
+  {
+    if (digitalRead(SDA_PIN) == HIGH)
+      break;  // slave already released the bus
+    digitalWrite(SCL_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(SCL_PIN, HIGH);
+    delayMicroseconds(5);
+  }
+
+  // Manual STOP condition: SDA low-to-high while SCL is high.
+  pinMode(SDA_PIN, OUTPUT);
+  digitalWrite(SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(SDA_PIN, HIGH);
+  delayMicroseconds(5);
+}
+
 void setupTiltSensor()
 {
+  recoverStuckI2CBus();
   Wire.begin(SDA_PIN, SCL_PIN);
+  // Explicit, conservative clock -- esp32 core 3.3.8's overhauled I2C
+  // driver has documented crash/instability reports on reads at default
+  // settings (espressif/arduino-esp32#11374); this is the first thing worth
+  // ruling out rather than assuming whatever the core's own default is.
+  Wire.setClock(100000);
 
   // mpu.begin() was found to fail on EVERY attempt within a ~1s retry
   // window after a true power cycle (not just the first one or two),
@@ -440,6 +484,17 @@ void setupTiltSensor()
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // The crash seen right after a fresh boot (Guru Meditation Error,
+  // IllegalInstruction, deep in esp-idf's i2c_master driver) happens on the
+  // FIRST getEvent() burst-read in the main loop -- not during any of the
+  // single-register writes above, which all succeed fine (this function
+  // finishes and prints "Tilt sensor init done" before the crash). A short
+  // settle here, after begin()/config succeed but before the main loop
+  // starts hammering the bus with real reads, is a cheap way to reduce how
+  // often that race gets hit.
+  if (mpuOk)
+    delay(100);
 }
 
 // Shares the Wire bus Wire.begin(SDA_PIN, SCL_PIN) already set up in
@@ -552,6 +607,17 @@ void loop()
 //                                  Tilt sensing
 // ---------------------------------------------------------------------------------
 
+// Wraps an angle into (-180, 180] -- see the note in updateTilt() about why
+// this is needed on top of atan2's own bounded output.
+float normalizeAngle180(float angle)
+{
+  while (angle > 180.0)
+    angle -= 360.0;
+  while (angle <= -180.0)
+    angle += 360.0;
+  return angle;
+}
+
 void updateTilt()
 {
   // Make a never-initialized sensor obvious (NAN, same pattern as a
@@ -584,8 +650,14 @@ void updateTilt()
   ayAvg /= TILT_SAMPLE_COUNT;
   azAvg /= TILT_SAMPLE_COUNT;
 
-  float pitchDegrees = PITCH_SIGN * PITCH_FROM_AXES(axAvg, ayAvg, azAvg) - pitchOffset;
-  float rollDegrees = ROLL_SIGN * ROLL_FROM_AXES(axAvg, ayAvg, azAvg) - rollOffset;
+  // ROLL_FROM_AXES's "- 90.0" shifts atan2's naturally-bounded (-180,180]
+  // output to (-270,90] -- not symmetric, and subtracting rollOffset can
+  // push it further outside a sane range (e.g. "252 degrees" instead of a
+  // small number near the board's resting orientation, which sits close to
+  // atan2's wraparound point). Normalize both angles back to (-180,180]
+  // after the offset so the UI always shows a believable tilt value.
+  float pitchDegrees = normalizeAngle180(PITCH_SIGN * PITCH_FROM_AXES(axAvg, ayAvg, azAvg) - pitchOffset);
+  float rollDegrees = normalizeAngle180(ROLL_SIGN * ROLL_FROM_AXES(axAvg, ayAvg, azAvg) - rollOffset);
 
   if (LEVEL_POINT_DISTANCE_INCHES > 0)
   {
@@ -714,9 +786,18 @@ void updateFanControl()
 
 void transmitPacket()
 {
+  // Found via the backgroundUpdate() timing diagnostic: endPacket()'s
+  // default is BLOCKING -- it doesn't return until the packet has fully
+  // gone out over the air (~750ms at this radio's spreading factor/
+  // bandwidth), freezing the whole loop (touch polling included) for over
+  // a third of every 2-second transmit interval. That's not new behavior,
+  // just newly noticeable now that there's a lot more screen navigation
+  // than the original single-screen UI. endPacket(true) is async -- it
+  // starts the transmission and returns immediately; the radio finishes it
+  // in the background well within the 2-second gap before the next call.
   LoRa.beginPacket();
   LoRa.write((uint8_t *)&txPacket, sizeof(txPacket));
-  LoRa.endPacket();
+  LoRa.endPacket(true);
 
   Serial.print("TX  pitch=");
   Serial.print(txPacket.pitch, 1);
@@ -759,6 +840,12 @@ void transmitPacket()
 // screen's own while(true) loop below.
 void backgroundUpdate()
 {
+  // Diagnostic for the "everything feels slower" report -- this runs on
+  // every loop iteration of every screen, so timing it here will catch
+  // whatever's actually slow (sensor read, transmit, RTC I2C) without
+  // spamming Serial during normal-speed iterations.
+  unsigned long startMs = millis();
+
   updateTilt();
   updateTemperatures();
   updateFanControl();
@@ -768,11 +855,42 @@ void backgroundUpdate()
     lastTransmitTime = millis();
     transmitPacket();
   }
+
+  unsigned long elapsedMs = millis() - startMs;
+  if (elapsedMs > 100)
+  {
+    Serial.print("backgroundUpdate() took ");
+    Serial.print(elapsedMs);
+    Serial.println(" ms (slow)");
+  }
 }
 
 // ---------------------------------------------------------------------------------
 //                          Shared display helpers
 // ---------------------------------------------------------------------------------
+
+// Shared 12-hour <-> 24-hour conversion, used by both the Set Time screen
+// and Schedule Fan Control's Start/End Hr -- storage (EEPROM, RTC) and the
+// schedule-window comparison in updateFanControl() all stay in 24-hour;
+// only the on-screen entry widgets are 12-hour + AM/PM.
+int hour12From24(int hour24)
+{
+  int hour12 = hour24 % 12;
+  return (hour12 == 0) ? 12 : hour12;
+}
+
+int ampmFrom24(int hour24)
+{
+  return (hour24 >= 12) ? 1 : 0;
+}
+
+int hour24From12AndAmPm(int hour12, int ampm)
+{
+  int hour24 = hour12 % 12;
+  if (ampm == 1)
+    hour24 += 12;
+  return hour24;
+}
 
 // Formats a signed tilt value as a direction word + magnitude, e.g.
 // "Nose High 2.3 deg" instead of a signed number -- easier to act on at a
@@ -785,7 +903,9 @@ void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *
   snprintf(buf, bufSize, "%s %.1f %s", direction, magnitude, unit);
 }
 
-void formatTime(char *buf, size_t bufSize)
+// 12-hour clock with AM/PM, matching the Set Time screen's entry format,
+// plus the date (MM/DD/YYYY) since Level/Temps have the room for it.
+void formatDateTime(char *buf, size_t bufSize)
 {
   if (!rtcAvailable)
   {
@@ -793,31 +913,51 @@ void formatTime(char *buf, size_t bufSize)
     return;
   }
   DateTime now = rtc.now();
-  snprintf(buf, bufSize, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  int hour24 = now.hour();
+  const char *ampm = (hour24 >= 12) ? "PM" : "AM";
+  int hour12 = hour24 % 12;
+  if (hour12 == 0)
+    hour12 = 12;
+  snprintf(buf, bufSize, "%02d/%02d/%04d %d:%02d %s", now.month(), now.day(), now.year(), hour12, now.minute(), ampm);
 }
 
 // Shared by commandLevel()/commandTemps(): a simple label (left column) +
 // value (right column) row layout, label drawn once at screen entry,
-// value redrawn every loop iteration via drawInfoValue().
-const int INFO_VALUE_COLUMN_X = 140;
-const int INFO_LINE_HEIGHT = 24;
+// value redrawn every loop iteration via drawInfoValue(). Line height and
+// value column position are computed fresh each time from the CURRENT font
+// (caller must ui.lcdSetFont(...) before calling) and row count, so each
+// screen can use as large a font as its row count leaves room for.
 int infoFirstLineY = 0;
+int infoLineHeight = 24;
+int infoValueColumnX = 140;
 
-void drawInfoLabels(const char *labels[], int count)
+void drawInfoLabels(const char *labels[], int count, int lineHeight)
 {
+  infoLineHeight = lineHeight;
   infoFirstLineY = ui.displaySpaceTopY + 10;
+
+  int maxLabelWidth = 0;
   for (int i = 0; i < count; i++)
   {
-    ui.lcdSetCursorXY(ui.displaySpaceLeftX + 6, infoFirstLineY + i * INFO_LINE_HEIGHT);
+    int w = ui.lcdStringWidthInPixels(labels[i]);
+    if (w > maxLabelWidth)
+      maxLabelWidth = w;
+  }
+  infoValueColumnX = ui.displaySpaceLeftX + 6 + maxLabelWidth + 8;
+
+  for (int i = 0; i < count; i++)
+  {
+    ui.lcdSetCursorXY(ui.displaySpaceLeftX + 6, infoFirstLineY + i * infoLineHeight);
     ui.lcdPrint(labels[i]);
   }
 }
 
 void drawInfoValue(int rowIndex, const char *value)
 {
-  int y = infoFirstLineY + rowIndex * INFO_LINE_HEIGHT;
-  ui.lcdDrawFilledRectangle(INFO_VALUE_COLUMN_X, y, 170, ui.lcdGetFontHeightWithDecenders(), LCD_BLACK);
-  ui.lcdSetCursorXY(INFO_VALUE_COLUMN_X, y);
+  int y = infoFirstLineY + rowIndex * infoLineHeight;
+  int eraseWidth = ui.displaySpaceLeftX + ui.displaySpaceWidth - infoValueColumnX - 6;
+  ui.lcdDrawFilledRectangle(infoValueColumnX, y, eraseWidth, ui.lcdGetFontHeightWithDecenders(), LCD_BLUE);
+  ui.lcdSetCursorXY(infoValueColumnX, y);
   ui.lcdPrint(value);
 }
 
@@ -827,25 +967,39 @@ void drawInfoValue(int rowIndex, const char *value)
 
 void commandLevel(void)
 {
-  ui.drawTitleBarWithBackButton("Level");
-  ui.clearDisplaySpace();
+  // Title bar font is a library-wide setting (used by every screen's title
+  // and the main menu), so bump it just for this screen and restore the
+  // default before returning -- otherwise it'd leak into whatever screen
+  // comes next.
+  ui.setTitleBarFont(UI_Font_16_Bold);
+  ui.drawTitleBarWithBackButton("Level Status");
+  ui.clearDisplaySpace(LCD_BLUE);
 
-  const char *labels[] = {"Front to Back", "Left/Right", "Time"};
-  drawInfoLabels(labels, 3);
+  // Only 3 rows on this screen -- plenty of vertical room, so use the
+  // largest available font.
+  ui.lcdSetFont(UI_Font_16_Bold);
+  ui.lcdSetFontColor(LCD_WHITE);
+  const char *labels[] = {"Front/Back", "Left/Right", "Date/Time"};
+  drawInfoLabels(labels, 3, ui.displaySpaceHeight / 3);
 
   while (true)
   {
     ui.getTouchEvents();
     backgroundUpdate();
     if (ui.checkForBackButtonClicked())
+    {
+      ui.setTitleBarFont(UI_Font_13_Bold);
       return;
+    }
 
     char buf[24];
     formatDirectionalValue(buf, sizeof(buf), txPacket.pitch, "Nose High", "Nose Low");
     drawInfoValue(0, buf);
-    formatDirectionalValue(buf, sizeof(buf), txPacket.roll, "Left High", "Right High");
+    // Roll sign here describes the LOW side, since that's the one that
+    // needs a block/shim under it -- you can't lower the high side.
+    formatDirectionalValue(buf, sizeof(buf), txPacket.roll, "Right Low", "Left Low");
     drawInfoValue(1, buf);
-    formatTime(buf, sizeof(buf));
+    formatDateTime(buf, sizeof(buf));
     drawInfoValue(2, buf);
 
     delay(50);
@@ -859,10 +1013,14 @@ void commandLevel(void)
 void commandTemps(void)
 {
   ui.drawTitleBarWithBackButton("Temperatures");
-  ui.clearDisplaySpace();
+  ui.clearDisplaySpace(LCD_BLUE);
 
-  const char *labels[] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet", "Time"};
-  drawInfoLabels(labels, 5);
+  // 5 rows here vs. 3 on the Level screen -- still room to grow from the
+  // original small font, just not as large.
+  ui.lcdSetFont(UI_Font_16_Bold);
+  ui.lcdSetFontColor(LCD_WHITE);
+  const char *labels[] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet", "Date/Time"};
+  drawInfoLabels(labels, 5, ui.displaySpaceHeight / 5);
 
   while (true)
   {
@@ -880,7 +1038,7 @@ void commandTemps(void)
     drawInfoValue(2, buf);
     snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp4);
     drawInfoValue(3, buf);
-    formatTime(buf, sizeof(buf));
+    formatDateTime(buf, sizeof(buf));
     drawInfoValue(4, buf);
 
     delay(50);
@@ -890,108 +1048,113 @@ void commandTemps(void)
 // ---------------------------------------------------------------------------------
 //                           Screen 3: Fan Control
 // ---------------------------------------------------------------------------------
-
-// NOTE on SELECTION_BOX.width: it's the TOTAL width, split evenly across
-// all choice cells ((width-3)/numberOfCells per cell, see
-// getCoordsOfSelectionBoxCell() in the library) -- NOT the width of one
-// cell. A 4-choice box needs real screen width to stay legible, which is
-// why Probe gets its own full-width row below rather than sharing a
-// 2-column layout with the other 5 widgets.
 //
-// Also: unused choice slots must be "" (empty string), not NULL --
-// countSelectionBoxChoices() checks choice2Text[0]/choice3Text[0], which
-// is a null-pointer dereference if those are NULL instead of "".
-SELECTION_BOX fanProbeBox = {"Probe", 0, "Fridge", "Freezer", "Inside AS", "DC Cabinet", 0, 0, 0, 0};
-SELECTION_BOX fanScheduleBox = {"Schedule", 0, "Disabled", "Enabled", "", "", 0, 0, 0, 0};
-NUMBER_BOX_FLOAT fanMinTempBox = {"Min Temp", 70.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
-NUMBER_BOX_FLOAT fanMaxTempBox = {"Max Temp", 90.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
-NUMBER_BOX fanStartHourBox = {"Start Hr", 8, 0, 23, 1, 0, 0, 0, 0};
-NUMBER_BOX fanEndHourBox = {"End Hr", 20, 0, 23, 1, 0, 0, 0, 0};
+// Split across 4 screens so each has room for its own bigger back button:
+// Fan Control (this) has the Schedule selector + links to Probe, Temp Range,
+// and Schedule Hours; those are their own screens with their own back
+// button (returning here). Forward-declared since they're only referenced
+// from commandFanControl() below, which is defined first.
+void commandFanProbe(void);
+void commandFanTempRange(void);
+void commandFanScheduleHours(void);
 
-// 4 rows: Probe (full width, needs room for 4 text choices), Schedule
-// (full width), then Min/Max Temp and Start/End Hour as 2-column rows
-// (NUMBER_BOX degrades gracefully at narrower widths, unlike SELECTION_BOX).
+SELECTION_BOX fanScheduleBox = {"Schedule", 0, "Disabled", "Enabled", "", "", 0, 0, 0, 0};
+BUTTON fanProbeLinkButton = {"Select Temperature Probe", 0, 0, 0, 0};
+BUTTON fanTempRangeLinkButton = {"Temp Range", 0, 0, 0, 0};
+BUTTON fanScheduleHoursLinkButton = {"Schedule Hours", 0, 0, 0, 0};
+
+// Draws a yellow border around the selected cell of a SELECTION_BOX,
+// matching the highlight style used on the Probe screen's buttons -- the
+// library's own drawSelectionBoxCell() only tints the selected cell's fill
+// color, not distinct enough at a glance. Replicates the cell-geometry math
+// from getCoordsOfSelectionBoxCell() (private in the library) since it only
+// needs box.width/numberOfCells -- see the SELECTION_BOX.width note above.
+void drawSelectionBoxHighlight(SELECTION_BOX &box, int numberOfCells)
+{
+  int cellWidth = (box.width - 3) / numberOfCells;
+  int overallWidth = cellWidth * numberOfCells;
+  int x = (box.centerX - overallWidth / 2) + (box.value * cellWidth);
+  int y = box.centerY - (box.height - 3) / 2;
+  int h = box.height - 3;
+  ui.lcdDrawRectangle(x, y, cellWidth, h, LCD_YELLOW);
+  ui.lcdDrawRectangle(x + 1, y + 1, cellWidth - 2, h - 2, LCD_YELLOW);
+}
+
+// 4 rows: Schedule (full width, only 2 choices so it fits fine inline),
+// then Probe link, then the two range/hours link buttons. Probe is its own
+// screen (see commandFanProbe() below) because a 4-choice SELECTION_BOX
+// with labels like "Inside AS"/"DC Cabinet" doesn't fit legibly in one row
+// even at full screen width -- lcdPrintCentered() doesn't truncate, so long
+// labels just overlap into neighboring cells.
 void layoutFanControlWidgets()
 {
-  // drawSelectionBox()/drawNumberBox() draw the label ABOVE the box itself
-  // (see TouchUserInterfaceForArduino.cpp), so each row needs headroom
-  // reserved for that label, not just the box height -- query the actual
-  // font metrics rather than guessing a fixed pixel value.
+  // drawSelectionBox() draws the label ABOVE the box itself (see
+  // TouchUserInterfaceForArduino.cpp), so the selector row needs headroom
+  // reserved for that label -- query the actual font metrics rather than
+  // guessing a fixed pixel value. BUTTON draws its label inside, so the
+  // link-button rows don't need that extra space.
   int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
   int rowHeight = ui.displaySpaceHeight / 4;
-  int rowWidgetHeight = rowHeight - labelSpace - 6;  // 6px gap before the next row
+  int selectionRowHeight = rowHeight - labelSpace - 6;
+  int buttonRowHeight = rowHeight - 20;
 
   int fullWidth = ui.displaySpaceWidth - 20;
   int fullCenterX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
 
-  int colWidth = ui.displaySpaceWidth / 2;
-  int leftX = ui.displaySpaceLeftX + colWidth / 2;
-  int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
-  int halfWidth = colWidth - 20;
-
-  int row1Y = ui.displaySpaceTopY + labelSpace + rowWidgetHeight / 2;
-  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + rowWidgetHeight / 2;
-  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + labelSpace + rowWidgetHeight / 2;
-  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + labelSpace + rowWidgetHeight / 2;
-
-  fanProbeBox.centerX = fullCenterX;
-  fanProbeBox.centerY = row1Y;
-  fanProbeBox.width = fullWidth;
-  fanProbeBox.height = rowWidgetHeight;
+  int row1Y = ui.displaySpaceTopY + labelSpace + selectionRowHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
+  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
+  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + rowHeight / 2;
 
   fanScheduleBox.centerX = fullCenterX;
-  fanScheduleBox.centerY = row2Y;
+  fanScheduleBox.centerY = row1Y;
   fanScheduleBox.width = fullWidth;
-  fanScheduleBox.height = rowWidgetHeight;
+  fanScheduleBox.height = selectionRowHeight;
 
-  fanMinTempBox.centerX = leftX;
-  fanMinTempBox.centerY = row3Y;
-  fanMinTempBox.width = halfWidth;
-  fanMinTempBox.height = rowWidgetHeight;
+  fanProbeLinkButton.centerX = fullCenterX;
+  fanProbeLinkButton.centerY = row2Y;
+  fanProbeLinkButton.width = fullWidth;
+  fanProbeLinkButton.height = buttonRowHeight;
 
-  fanMaxTempBox.centerX = rightX;
-  fanMaxTempBox.centerY = row3Y;
-  fanMaxTempBox.width = halfWidth;
-  fanMaxTempBox.height = rowWidgetHeight;
+  fanTempRangeLinkButton.centerX = fullCenterX;
+  fanTempRangeLinkButton.centerY = row3Y;
+  fanTempRangeLinkButton.width = fullWidth;
+  fanTempRangeLinkButton.height = buttonRowHeight;
 
-  fanStartHourBox.centerX = leftX;
-  fanStartHourBox.centerY = row4Y;
-  fanStartHourBox.width = halfWidth;
-  fanStartHourBox.height = rowWidgetHeight;
-
-  fanEndHourBox.centerX = rightX;
-  fanEndHourBox.centerY = row4Y;
-  fanEndHourBox.width = halfWidth;
-  fanEndHourBox.height = rowWidgetHeight;
+  fanScheduleHoursLinkButton.centerX = fullCenterX;
+  fanScheduleHoursLinkButton.centerY = row4Y;
+  fanScheduleHoursLinkButton.width = fullWidth;
+  fanScheduleHoursLinkButton.height = buttonRowHeight;
 }
 
 void drawFanControlTitleBar()
 {
-  char title[24];
-  snprintf(title, sizeof(title), "Fan Control - %s", fanOn ? "ON" : "OFF");
+  char title[32];
+  snprintf(title, sizeof(title), "Fan Control Circuit - %s", fanOn ? "ON" : "OFF");
   ui.drawTitleBarWithBackButton(title);
 }
 
-void commandFanControl(void)
+// Redraws the whole Fan Control screen -- called at screen entry, and again
+// after returning from any link screen since those overwrite the display.
+void drawFanControlScreen()
 {
+  ui.lcdSetFont(UI_Font_13_Bold);
   drawFanControlTitleBar();
   ui.clearDisplaySpace();
   layoutFanControlWidgets();
 
-  fanProbeBox.value = fanProbeIndex;
   fanScheduleBox.value = fanTimeEnabled;
-  fanMinTempBox.value = fanMinTemp;
-  fanMaxTempBox.value = fanMaxTemp;
-  fanStartHourBox.value = fanStartHour;
-  fanEndHourBox.value = fanEndHour;
 
-  ui.drawSelectionBox(fanProbeBox);
   ui.drawSelectionBox(fanScheduleBox);
-  ui.drawNumberBox(fanMinTempBox);
-  ui.drawNumberBox(fanMaxTempBox);
-  ui.drawNumberBox(fanStartHourBox);
-  ui.drawNumberBox(fanEndHourBox);
+  drawSelectionBoxHighlight(fanScheduleBox, 2);
+  ui.drawButton(fanProbeLinkButton);
+  ui.drawButton(fanTempRangeLinkButton);
+  ui.drawButton(fanScheduleHoursLinkButton);
+}
 
+void commandFanControl(void)
+{
+  drawFanControlScreen();
   bool lastFanOn = fanOn;
 
   while (true)
@@ -1001,41 +1164,31 @@ void commandFanControl(void)
     if (ui.checkForBackButtonClicked())
       return;
 
-    if (ui.checkForSelectionBoxTouched(fanProbeBox))
-    {
-      fanProbeIndex = fanProbeBox.value;
-      ui.writeConfigurationInt(EEPROM_ADDR_FAN_PROBE, fanProbeIndex);
-      flushEepromToFlash();
-    }
     if (ui.checkForSelectionBoxTouched(fanScheduleBox))
     {
       fanTimeEnabled = fanScheduleBox.value;
       ui.writeConfigurationInt(EEPROM_ADDR_FAN_TIME_ENABLE, fanTimeEnabled);
       flushEepromToFlash();
+      drawSelectionBoxHighlight(fanScheduleBox, 2);
     }
-    if (ui.checkForNumberBoxTouched(fanMinTempBox))
+
+    if (ui.checkForButtonClicked(fanProbeLinkButton))
     {
-      fanMinTemp = fanMinTempBox.value;
-      ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MIN_TEMP, fanMinTemp);
-      flushEepromToFlash();
+      commandFanProbe();
+      drawFanControlScreen();
+      lastFanOn = fanOn;
     }
-    if (ui.checkForNumberBoxTouched(fanMaxTempBox))
+    if (ui.checkForButtonClicked(fanTempRangeLinkButton))
     {
-      fanMaxTemp = fanMaxTempBox.value;
-      ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MAX_TEMP, fanMaxTemp);
-      flushEepromToFlash();
+      commandFanTempRange();
+      drawFanControlScreen();
+      lastFanOn = fanOn;
     }
-    if (ui.checkForNumberBoxTouched(fanStartHourBox))
+    if (ui.checkForButtonClicked(fanScheduleHoursLinkButton))
     {
-      fanStartHour = fanStartHourBox.value;
-      ui.writeConfigurationInt(EEPROM_ADDR_FAN_START_HOUR, fanStartHour);
-      flushEepromToFlash();
-    }
-    if (ui.checkForNumberBoxTouched(fanEndHourBox))
-    {
-      fanEndHour = fanEndHourBox.value;
-      ui.writeConfigurationInt(EEPROM_ADDR_FAN_END_HOUR, fanEndHour);
-      flushEepromToFlash();
+      commandFanScheduleHours();
+      drawFanControlScreen();
+      lastFanOn = fanOn;
     }
 
     // Relay state can change purely from temperature drifting (not just
@@ -1052,96 +1205,426 @@ void commandFanControl(void)
 }
 
 // ---------------------------------------------------------------------------------
+//                       Screen 3a: Fan Control -- Probe
+// ---------------------------------------------------------------------------------
+//
+// 4 full-width stacked buttons instead of a single-row SELECTION_BOX -- see
+// the note above layoutFanControlWidgets() for why. drawButton()'s
+// buttonSelectedFlg draws the currently-selected probe highlighted.
+
+BUTTON fanProbeButton0 = {"Fridge", 0, 0, 0, 0};
+BUTTON fanProbeButton1 = {"Freezer", 0, 0, 0, 0};
+BUTTON fanProbeButton2 = {"Inside AS", 0, 0, 0, 0};
+BUTTON fanProbeButton3 = {"DC Cabinet", 0, 0, 0, 0};
+
+void layoutFanProbeWidgets()
+{
+  int rowHeight = ui.displaySpaceHeight / 4;
+  int centerX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
+  int widgetWidth = ui.displaySpaceWidth - 40;
+  int widgetHeight = rowHeight - 20;
+
+  fanProbeButton0.centerX = centerX;
+  fanProbeButton0.centerY = ui.displaySpaceTopY + rowHeight / 2;
+  fanProbeButton0.width = widgetWidth;
+  fanProbeButton0.height = widgetHeight;
+
+  fanProbeButton1.centerX = centerX;
+  fanProbeButton1.centerY = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
+  fanProbeButton1.width = widgetWidth;
+  fanProbeButton1.height = widgetHeight;
+
+  fanProbeButton2.centerX = centerX;
+  fanProbeButton2.centerY = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
+  fanProbeButton2.width = widgetWidth;
+  fanProbeButton2.height = widgetHeight;
+
+  fanProbeButton3.centerX = centerX;
+  fanProbeButton3.centerY = ui.displaySpaceTopY + 3 * rowHeight + rowHeight / 2;
+  fanProbeButton3.width = widgetWidth;
+  fanProbeButton3.height = widgetHeight;
+}
+
+// The 2-arg drawButton(BUTTON&, selectedFlg) overload that would normally
+// highlight the selected choice is private in this library -- draw a
+// yellow border around the selected probe's button ourselves instead.
+void drawFanProbeButtons()
+{
+  ui.drawButton(fanProbeButton0);
+  ui.drawButton(fanProbeButton1);
+  ui.drawButton(fanProbeButton2);
+  ui.drawButton(fanProbeButton3);
+
+  BUTTON *selected = &fanProbeButton0;
+  if (fanProbeIndex == 1)
+    selected = &fanProbeButton1;
+  else if (fanProbeIndex == 2)
+    selected = &fanProbeButton2;
+  else if (fanProbeIndex == 3)
+    selected = &fanProbeButton3;
+
+  int x1 = selected->centerX - selected->width / 2;
+  int y1 = selected->centerY - selected->height / 2;
+  ui.lcdDrawRectangle(x1, y1, selected->width, selected->height, LCD_YELLOW);
+  ui.lcdDrawRectangle(x1 + 1, y1 + 1, selected->width - 2, selected->height - 2, LCD_YELLOW);
+}
+
+void commandFanProbe(void)
+{
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Select Temp Probe for Fan Circuit");
+  ui.clearDisplaySpace();
+  layoutFanProbeWidgets();
+  drawFanProbeButtons();
+
+  while (true)
+  {
+    ui.getTouchEvents();
+    backgroundUpdate();
+    if (ui.checkForBackButtonClicked())
+      return;
+
+    int newIndex = -1;
+    if (ui.checkForButtonClicked(fanProbeButton0)) newIndex = 0;
+    if (ui.checkForButtonClicked(fanProbeButton1)) newIndex = 1;
+    if (ui.checkForButtonClicked(fanProbeButton2)) newIndex = 2;
+    if (ui.checkForButtonClicked(fanProbeButton3)) newIndex = 3;
+
+    if (newIndex >= 0 && newIndex != fanProbeIndex)
+    {
+      fanProbeIndex = newIndex;
+      ui.writeConfigurationInt(EEPROM_ADDR_FAN_PROBE, fanProbeIndex);
+      flushEepromToFlash();
+      drawFanProbeButtons();
+    }
+
+    delay(50);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                    Screen 3a: Fan Control -- Temp Range
+// ---------------------------------------------------------------------------------
+
+NUMBER_BOX_FLOAT fanMinTempBox = {"Fan Off Temp", 70.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
+NUMBER_BOX_FLOAT fanMaxTempBox = {"Fan On Temp", 90.0, 32.0, 150.0, 1.0, 1, 0, 0, 0, 0};
+
+// Only 2 widgets on this screen -- a single row, generously sized.
+void layoutFanTempRangeWidgets()
+{
+  int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
+  int colWidth = ui.displaySpaceWidth / 2;
+  int widgetHeight = ui.displaySpaceHeight - labelSpace - 30;
+  int leftX = ui.displaySpaceLeftX + colWidth / 2;
+  int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
+  int widgetWidth = colWidth - 20;
+  int rowY = ui.displaySpaceTopY + labelSpace + widgetHeight / 2 + 10;
+
+  fanMinTempBox.centerX = leftX;
+  fanMinTempBox.centerY = rowY;
+  fanMinTempBox.width = widgetWidth;
+  fanMinTempBox.height = widgetHeight;
+
+  fanMaxTempBox.centerX = rightX;
+  fanMaxTempBox.centerY = rowY;
+  fanMaxTempBox.width = widgetWidth;
+  fanMaxTempBox.height = widgetHeight;
+}
+
+void commandFanTempRange(void)
+{
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Temp Range");
+  ui.clearDisplaySpace();
+  layoutFanTempRangeWidgets();
+
+  fanMinTempBox.value = fanMinTemp;
+  fanMaxTempBox.value = fanMaxTemp;
+
+  ui.drawNumberBox(fanMinTempBox);
+  ui.drawNumberBox(fanMaxTempBox);
+
+  while (true)
+  {
+    ui.getTouchEvents();
+    backgroundUpdate();
+    if (ui.checkForBackButtonClicked())
+      return;
+
+    if (ui.checkForNumberBoxTouched(fanMinTempBox))
+    {
+      fanMinTemp = fanMinTempBox.value;
+      ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MIN_TEMP, fanMinTemp);
+      flushEepromToFlash();
+    }
+    if (ui.checkForNumberBoxTouched(fanMaxTempBox))
+    {
+      fanMaxTemp = fanMaxTempBox.value;
+      ui.writeConfigurationFloat(EEPROM_ADDR_FAN_MAX_TEMP, fanMaxTemp);
+      flushEepromToFlash();
+    }
+
+    delay(50);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                  Screen 3b: Fan Control -- Schedule Hours
+// ---------------------------------------------------------------------------------
+
+// Hour is kept in 12-hour form (1-12) with a separate AM/PM selector, same
+// pattern as the Set Time screen -- fanStartHour/fanEndHour themselves stay
+// 24-hour (that's what's persisted to EEPROM and compared against
+// rtc.now().hour() in updateFanControl()'s schedule-window check).
+NUMBER_BOX fanStartHourBox = {"Start Hr", 8, 1, 12, 1, 0, 0, 0, 0};
+NUMBER_BOX fanEndHourBox = {"End Hr", 8, 1, 12, 1, 0, 0, 0, 0};
+SELECTION_BOX fanStartAmPmBox = {"AM/PM", 0, "AM", "PM", "", "", 0, 0, 0, 0};
+SELECTION_BOX fanEndAmPmBox = {"AM/PM", 0, "AM", "PM", "", "", 0, 0, 0, 0};
+
+// 2x2 grid: Start/End Hr on top, their AM/PM selectors below.
+void layoutFanScheduleHoursWidgets()
+{
+  int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
+  int rowHeight = ui.displaySpaceHeight / 2;
+  int colWidth = ui.displaySpaceWidth / 2;
+  int widgetHeight = rowHeight - labelSpace - 6;
+
+  int leftX = ui.displaySpaceLeftX + colWidth / 2;
+  int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
+  int widgetWidth = colWidth - 20;
+
+  int row1Y = ui.displaySpaceTopY + labelSpace + widgetHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + widgetHeight / 2;
+
+  fanStartHourBox.centerX = leftX;
+  fanStartHourBox.centerY = row1Y;
+  fanStartHourBox.width = widgetWidth;
+  fanStartHourBox.height = widgetHeight;
+
+  fanEndHourBox.centerX = rightX;
+  fanEndHourBox.centerY = row1Y;
+  fanEndHourBox.width = widgetWidth;
+  fanEndHourBox.height = widgetHeight;
+
+  fanStartAmPmBox.centerX = leftX;
+  fanStartAmPmBox.centerY = row2Y;
+  fanStartAmPmBox.width = widgetWidth;
+  fanStartAmPmBox.height = widgetHeight;
+
+  fanEndAmPmBox.centerX = rightX;
+  fanEndAmPmBox.centerY = row2Y;
+  fanEndAmPmBox.width = widgetWidth;
+  fanEndAmPmBox.height = widgetHeight;
+}
+
+void commandFanScheduleHours(void)
+{
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Schedule Fan Control");
+  ui.clearDisplaySpace();
+  layoutFanScheduleHoursWidgets();
+
+  fanStartHourBox.value = hour12From24(fanStartHour);
+  fanStartAmPmBox.value = ampmFrom24(fanStartHour);
+  fanEndHourBox.value = hour12From24(fanEndHour);
+  fanEndAmPmBox.value = ampmFrom24(fanEndHour);
+
+  ui.drawNumberBox(fanStartHourBox);
+  ui.drawNumberBox(fanEndHourBox);
+  ui.drawSelectionBox(fanStartAmPmBox);
+  ui.drawSelectionBox(fanEndAmPmBox);
+
+  while (true)
+  {
+    ui.getTouchEvents();
+    backgroundUpdate();
+    if (ui.checkForBackButtonClicked())
+      return;
+
+    boolean startChanged = ui.checkForNumberBoxTouched(fanStartHourBox);
+    startChanged |= ui.checkForSelectionBoxTouched(fanStartAmPmBox);
+    if (startChanged)
+    {
+      fanStartHour = hour24From12AndAmPm(fanStartHourBox.value, fanStartAmPmBox.value);
+      ui.writeConfigurationInt(EEPROM_ADDR_FAN_START_HOUR, fanStartHour);
+      flushEepromToFlash();
+    }
+
+    boolean endChanged = ui.checkForNumberBoxTouched(fanEndHourBox);
+    endChanged |= ui.checkForSelectionBoxTouched(fanEndAmPmBox);
+    if (endChanged)
+    {
+      fanEndHour = hour24From12AndAmPm(fanEndHourBox.value, fanEndAmPmBox.value);
+      ui.writeConfigurationInt(EEPROM_ADDR_FAN_END_HOUR, fanEndHour);
+      flushEepromToFlash();
+    }
+
+    delay(50);
+  }
+}
+
+// ---------------------------------------------------------------------------------
 //                             Screen 4: Settings
+// ---------------------------------------------------------------------------------
+//
+// Split across 3 screens for the same reason as Fan Control: Settings (this)
+// has Zero Level + links to Date and Time, each their own screen with their
+// own back button (returning here).
+void commandSettingsDate(void);
+void commandSettingsTime(void);
+
+BUTTON zeroLevelButton = {"Zero Level", 0, 0, 0, 0};
+BUTTON settingsDateLinkButton = {"Date", 0, 0, 0, 0};
+BUTTON settingsTimeLinkButton = {"Time", 0, 0, 0, 0};
+
+// 3 rows, all full-width buttons -- lots of room since this screen only
+// has links + one action now.
+void layoutSettingsWidgets()
+{
+  int rowHeight = ui.displaySpaceHeight / 3;
+  int centerX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
+  int widgetWidth = ui.displaySpaceWidth - 40;
+  int widgetHeight = rowHeight - 20;
+
+  zeroLevelButton.centerX = centerX;
+  zeroLevelButton.centerY = ui.displaySpaceTopY + rowHeight / 2;
+  zeroLevelButton.width = widgetWidth;
+  zeroLevelButton.height = widgetHeight;
+
+  settingsDateLinkButton.centerX = centerX;
+  settingsDateLinkButton.centerY = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
+  settingsDateLinkButton.width = widgetWidth;
+  settingsDateLinkButton.height = widgetHeight;
+
+  settingsTimeLinkButton.centerX = centerX;
+  settingsTimeLinkButton.centerY = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
+  settingsTimeLinkButton.width = widgetWidth;
+  settingsTimeLinkButton.height = widgetHeight;
+}
+
+// Redraws the whole Settings screen -- called at screen entry, and again
+// after returning from either link screen since those overwrite the display.
+void drawSettingsScreen()
+{
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Settings");
+  ui.clearDisplaySpace();
+  layoutSettingsWidgets();
+
+  ui.drawButton(zeroLevelButton);
+  ui.drawButton(settingsDateLinkButton);
+  ui.drawButton(settingsTimeLinkButton);
+}
+
+void commandSettings(void)
+{
+  drawSettingsScreen();
+
+  while (true)
+  {
+    ui.getTouchEvents();
+    backgroundUpdate();
+    if (ui.checkForBackButtonClicked())
+      return;
+
+    if (ui.checkForButtonClicked(zeroLevelButton))
+    {
+      pitchOffset += txPacket.pitch;
+      rollOffset += txPacket.roll;
+      ui.writeConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, pitchOffset);
+      ui.writeConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, rollOffset);
+      flushEepromToFlash();
+    }
+
+    if (ui.checkForButtonClicked(settingsDateLinkButton))
+    {
+      commandSettingsDate();
+      drawSettingsScreen();
+    }
+    if (ui.checkForButtonClicked(settingsTimeLinkButton))
+    {
+      commandSettingsTime();
+      drawSettingsScreen();
+    }
+
+    delay(50);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                          Screen 4a: Settings -- Date
 // ---------------------------------------------------------------------------------
 
 NUMBER_BOX yearBox = {"Year", 2026, 2020, 2099, 1, 0, 0, 0, 0};
 NUMBER_BOX monthBox = {"Month", 1, 1, 12, 1, 0, 0, 0, 0};
 NUMBER_BOX dayBox = {"Day", 1, 1, 31, 1, 0, 0, 0, 0};
-NUMBER_BOX hourBox = {"Hour", 0, 0, 23, 1, 0, 0, 0, 0};
-NUMBER_BOX minuteBox = {"Minute", 0, 0, 59, 1, 0, 0, 0, 0};
-BUTTON saveTimeButton = {"Save Time", 0, 0, 0, 0};
-BUTTON zeroLevelButton = {"Zero Level", 0, 0, 0, 0};
+BUTTON saveDateButton = {"Save Date", 0, 0, 0, 0};
 
-// 2-column x 4-row grid: Year/Month, Day/Hour, Minute/(empty), Save Time/Zero Level.
-// NUMBER_BOX draws its label above the box (BUTTON draws its label inside),
-// so headroom is reserved for every row for simplicity -- harmless extra
-// gap above the row 4 buttons, but avoids the rows 1-3 label/box overlap
-// this exact mistake caused on the Fan Control screen.
-void layoutSettingsWidgets()
+// Month/Day/Year across one row, Save Date below -- 3-column layout with
+// no label-space needed on the button row (BUTTON draws its label inside).
+void layoutSettingsDateWidgets()
 {
   int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
-  int colWidth = ui.displaySpaceWidth / 2;
-  int rowHeight = ui.displaySpaceHeight / 4;
-  int leftX = ui.displaySpaceLeftX + colWidth / 2;
-  int rightX = ui.displaySpaceLeftX + colWidth + colWidth / 2;
-  int widgetWidth = colWidth - 20;
+  int rowHeight = ui.displaySpaceHeight / 2;
+  int colWidth = ui.displaySpaceWidth / 3;
   int widgetHeight = rowHeight - labelSpace - 6;
 
+  int col1X = ui.displaySpaceLeftX + colWidth / 2;
+  int col2X = ui.displaySpaceLeftX + colWidth + colWidth / 2;
+  int col3X = ui.displaySpaceLeftX + 2 * colWidth + colWidth / 2;
+  int widgetWidth = colWidth - 20;
+
   int row1Y = ui.displaySpaceTopY + labelSpace + widgetHeight / 2;
-  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + widgetHeight / 2;
-  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + labelSpace + widgetHeight / 2;
-  int row4Y = ui.displaySpaceTopY + 3 * rowHeight + labelSpace + widgetHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + (rowHeight - 20) / 2;
+  int saveButtonHeight = 50;
 
-  yearBox.centerX = leftX;
-  yearBox.centerY = row1Y;
-  yearBox.width = widgetWidth;
-  yearBox.height = widgetHeight;
-
-  monthBox.centerX = rightX;
+  monthBox.centerX = col1X;
   monthBox.centerY = row1Y;
   monthBox.width = widgetWidth;
   monthBox.height = widgetHeight;
 
-  dayBox.centerX = leftX;
-  dayBox.centerY = row2Y;
+  dayBox.centerX = col2X;
+  dayBox.centerY = row1Y;
   dayBox.width = widgetWidth;
   dayBox.height = widgetHeight;
 
-  hourBox.centerX = rightX;
-  hourBox.centerY = row2Y;
-  hourBox.width = widgetWidth;
-  hourBox.height = widgetHeight;
+  yearBox.centerX = col3X;
+  yearBox.centerY = row1Y;
+  yearBox.width = widgetWidth;
+  yearBox.height = widgetHeight;
 
-  minuteBox.centerX = leftX;
-  minuteBox.centerY = row3Y;
-  minuteBox.width = widgetWidth;
-  minuteBox.height = widgetHeight;
-
-  saveTimeButton.centerX = leftX;
-  saveTimeButton.centerY = row4Y;
-  saveTimeButton.width = widgetWidth;
-  saveTimeButton.height = widgetHeight;
-
-  zeroLevelButton.centerX = rightX;
-  zeroLevelButton.centerY = row4Y;
-  zeroLevelButton.width = widgetWidth;
-  zeroLevelButton.height = widgetHeight;
+  saveDateButton.centerX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
+  saveDateButton.centerY = row2Y;
+  saveDateButton.width = ui.displaySpaceWidth - 60;
+  saveDateButton.height = saveButtonHeight;
 }
 
-void commandSettings(void)
+void commandSettingsDate(void)
 {
-  ui.drawTitleBarWithBackButton("Settings");
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Set Date");
   ui.clearDisplaySpace();
-  layoutSettingsWidgets();
+  layoutSettingsDateWidgets();
 
   if (rtcAvailable)
   {
+    // A glitched I2C read (e.g. right after boot, while the MPU6050 on the
+    // same bus is still retrying) can hand back garbage bytes -- clamp to
+    // each box's own valid range rather than displaying/allowing something
+    // like "month 160" that NUMBER_BOX would never let you dial in by hand.
     DateTime now = rtc.now();
-    yearBox.value = now.year();
-    monthBox.value = now.month();
-    dayBox.value = now.day();
-    hourBox.value = now.hour();
-    minuteBox.value = now.minute();
+    int y = now.year();
+    int mo = now.month();
+    int d = now.day();
+    yearBox.value = (y >= yearBox.minimumValue && y <= yearBox.maximumValue) ? y : yearBox.value;
+    monthBox.value = (mo >= monthBox.minimumValue && mo <= monthBox.maximumValue) ? mo : monthBox.value;
+    dayBox.value = (d >= dayBox.minimumValue && d <= dayBox.maximumValue) ? d : dayBox.value;
   }
 
-  ui.drawNumberBox(yearBox);
   ui.drawNumberBox(monthBox);
   ui.drawNumberBox(dayBox);
-  ui.drawNumberBox(hourBox);
-  ui.drawNumberBox(minuteBox);
-  ui.drawButton(saveTimeButton);
-  ui.drawButton(zeroLevelButton);
+  ui.drawNumberBox(yearBox);
+  ui.drawButton(saveDateButton);
 
   while (true)
   {
@@ -1153,22 +1636,104 @@ void commandSettings(void)
     ui.checkForNumberBoxTouched(yearBox);
     ui.checkForNumberBoxTouched(monthBox);
     ui.checkForNumberBoxTouched(dayBox);
+
+    if (ui.checkForButtonClicked(saveDateButton) && rtcAvailable)
+    {
+      DateTime current = rtc.now();
+      rtc.adjust(DateTime(yearBox.value, monthBox.value, dayBox.value, current.hour(), current.minute(), current.second()));
+      Serial.println("RTC date saved from Date screen");
+    }
+
+    delay(50);
+  }
+}
+
+// ---------------------------------------------------------------------------------
+//                          Screen 4b: Settings -- Time
+// ---------------------------------------------------------------------------------
+
+// Hour is kept in 12-hour form (1-12) with a separate AM/PM selector --
+// converted to/from the RTC's 24-hour DateTime at load/save time.
+NUMBER_BOX hourBox = {"Hour", 12, 1, 12, 1, 0, 0, 0, 0};
+NUMBER_BOX minuteBox = {"Minute", 0, 0, 59, 1, 0, 0, 0, 0};
+SELECTION_BOX ampmBox = {"AM/PM", 0, "AM", "PM", "", "", 0, 0, 0, 0};
+BUTTON saveTimeButton = {"Save Time", 0, 0, 0, 0};
+
+void layoutSettingsTimeWidgets()
+{
+  int labelSpace = ui.lcdGetFontHeightWithDecentersAndLineSpacing() + 4;
+  int rowHeight = ui.displaySpaceHeight / 3;
+  int colWidth = ui.displaySpaceWidth / 2;
+  int widgetHeight = rowHeight - labelSpace - 6;
+
+  int col1X = ui.displaySpaceLeftX + colWidth / 2;
+  int col2X = ui.displaySpaceLeftX + colWidth + colWidth / 2;
+  int widgetWidth = colWidth - 20;
+  int fullWidth = ui.displaySpaceWidth - 20;
+  int fullCenterX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
+
+  int row1Y = ui.displaySpaceTopY + labelSpace + widgetHeight / 2;
+  int row2Y = ui.displaySpaceTopY + rowHeight + labelSpace + widgetHeight / 2;
+  int row3Y = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
+
+  hourBox.centerX = col1X;
+  hourBox.centerY = row1Y;
+  hourBox.width = widgetWidth;
+  hourBox.height = widgetHeight;
+
+  minuteBox.centerX = col2X;
+  minuteBox.centerY = row1Y;
+  minuteBox.width = widgetWidth;
+  minuteBox.height = widgetHeight;
+
+  ampmBox.centerX = fullCenterX;
+  ampmBox.centerY = row2Y;
+  ampmBox.width = fullWidth;
+  ampmBox.height = widgetHeight;
+
+  saveTimeButton.centerX = fullCenterX;
+  saveTimeButton.centerY = row3Y;
+  saveTimeButton.width = fullWidth;
+  saveTimeButton.height = 50;
+}
+
+void commandSettingsTime(void)
+{
+  ui.lcdSetFont(UI_Font_13_Bold);
+  ui.drawTitleBarWithBackButton("Set Time");
+  ui.clearDisplaySpace();
+  layoutSettingsTimeWidgets();
+
+  if (rtcAvailable)
+  {
+    DateTime now = rtc.now();
+    hourBox.value = hour12From24(now.hour());
+    ampmBox.value = ampmFrom24(now.hour());
+    minuteBox.value = now.minute();
+  }
+
+  ui.drawNumberBox(hourBox);
+  ui.drawNumberBox(minuteBox);
+  ui.drawSelectionBox(ampmBox);
+  ui.drawButton(saveTimeButton);
+
+  while (true)
+  {
+    ui.getTouchEvents();
+    backgroundUpdate();
+    if (ui.checkForBackButtonClicked())
+      return;
+
     ui.checkForNumberBoxTouched(hourBox);
     ui.checkForNumberBoxTouched(minuteBox);
+    ui.checkForSelectionBoxTouched(ampmBox);
 
     if (ui.checkForButtonClicked(saveTimeButton) && rtcAvailable)
     {
-      rtc.adjust(DateTime(yearBox.value, monthBox.value, dayBox.value, hourBox.value, minuteBox.value, 0));
-      Serial.println("RTC time saved from Settings screen");
-    }
-
-    if (ui.checkForButtonClicked(zeroLevelButton))
-    {
-      pitchOffset += txPacket.pitch;
-      rollOffset += txPacket.roll;
-      ui.writeConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, pitchOffset);
-      ui.writeConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, rollOffset);
-      flushEepromToFlash();
+      int hour24 = hour24From12AndAmPm(hourBox.value, ampmBox.value);
+      DateTime current = rtc.now();
+      rtc.adjust(DateTime(current.year(), current.month(), current.day(), hour24, minuteBox.value, 0));
+      Serial.println("RTC time saved from Time screen");
     }
 
     delay(50);
