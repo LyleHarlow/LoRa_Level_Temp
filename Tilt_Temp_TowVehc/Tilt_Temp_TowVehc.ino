@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 19:20 PDT
+// Last updated: 2026-07-31 10:35 PDT
 
 //
 // Heltec WiFi LoRa 32 V2, built on Heltec's own board package + Heltec_ESP32
@@ -32,19 +32,105 @@
 #include "heltec.h"
 #include "LoRaPacket.h"
 
+#if defined(WIFI_LORA_32_V3)
+// driver/gpio.h exists in this core (confirmed on disk) but doesn't
+// resolve via #include here -- likely something about how the
+// precompiled Heltec_ESP32_Dev-Boards library exposes its include paths
+// to sketch code. Declare what's needed directly instead; esp_err_t/
+// gpio_num_t are already available transitively via heltec.h.
+extern "C" esp_err_t gpio_reset_pin(gpio_num_t gpio_num);
+// gpio_drive_cap_t itself is already available transitively (via
+// hal/gpio_types.h, pulled in by Arduino.h) -- only the function
+// declaration was missing.
+extern "C" esp_err_t gpio_set_drive_capability(gpio_num_t gpio_num, gpio_drive_cap_t strength);
+#endif
+
+// Defined up here (rather than down near where `buttons[]` is populated)
+// because the conditional #include <RadioLib.h> below shifts where
+// Arduino's auto-generated function prototypes get inserted -- same class
+// of gotcha as mainMenu[] in Tilt_Temp_AirStream.ino: buttonPressed()'s
+// auto-prototype ended up placed before this struct was visible.
+struct DebouncedButton
+{
+  int pin;
+  bool wasDown;
+};
+
 char this_file[] = "Tilt_Temp_TowVehc";
 char ver[] = "ver 2.2  " __DATE__;
 
 const long LORA_BAND = 915E6;
 
 // ---------------------------------------------------------------------------------
+//                                    V3 LoRa radio (RadioLib)
+// ---------------------------------------------------------------------------------
+// V3's radio chip is a genuinely different chip (SX1262, not V2's SX127x)
+// on its own dedicated pins -- separate from the general-purpose header
+// covered by the pin-mapping table below, and internal to the module (see
+// the separate "LoRa" box in Heltec's V3 pinout diagram). Heltec.begin()'s
+// automatic LoRa init only knows the classic SX127x API (Heltec_ESP32_Dev-
+// Boards' bundled lora/LoRa.cpp always calls the SX127x-style begin(),
+// which can't talk to an SX1262 -- it fails every time and hangs forever
+// in an infinite while(1) inside that library). So LoRaEnable is left
+// false in Heltec.begin() for V3, and the radio is driven directly here
+// via RadioLib instead.
+#if defined(WIFI_LORA_32_V3)
+#include <RadioLib.h>
+
+const int LORA_NSS_PIN = 8;
+const int LORA_SCK_PIN = 9;
+const int LORA_MOSI_PIN = 10;
+const int LORA_MISO_PIN = 11;
+const int LORA_RST_PIN = 12;
+const int LORA_BUSY_PIN = 13;
+const int LORA_DIO1_PIN = 14;
+
+SX1262 radio = new Module(LORA_NSS_PIN, LORA_DIO1_PIN, LORA_RST_PIN, LORA_BUSY_PIN);
+
+volatile bool loraPacketReceivedFlag = false;
+
+void IRAM_ATTR onLoraDio1Rise()
+{
+  loraPacketReceivedFlag = true;
+}
+#endif
+
+// ---------------------------------------------------------------------------------
 //                                    Pin definitions
 // ---------------------------------------------------------------------------------
 // OLED, LoRa radio, and Vext pins come from the board package (via
-// Heltec.begin()) and don't need to be defined here. These are the custom
-// pins specific to this carrier board -- see the Confirmed Hardware
-// section of the plan for how they were derived from the schematic.
+// Heltec.begin()) and don't need to be defined here -- those peripherals
+// are wired internally on the module itself (not through this carrier
+// PCB's header), so the board package's own V2/V3-specific config handles
+// them correctly regardless of which module is populated.
+//
+// These 6 signals ARE wired through this carrier PCB's header into fixed
+// physical pin positions, so which GPIO is actually present depends on
+// which module occupies that socket. WIFI_LORA_32_V2/V3 are defined by the
+// board package itself (boards.txt build.defines) based on Tools > Board,
+// so selecting the right board in the IDE picks the right pins here
+// automatically -- no manual toggle needed.
+//
+// V3 pin numbers below were initially derived by matching this carrier
+// board's schematic (U6 pin numbers, which correspond 1:1 to the V2
+// module's published edge pinout) against the V3 module's published
+// pinout at the SAME physical header positions -- that derivation got
+// LED2 wrong (40 instead of 39), since confirmed and corrected directly
+// on hardware; the other 5 matched. Three of these six land on pins with
+// real caveats on V3 (see inline comments) -- worth keeping in mind if
+// anything acts up.
+#if defined(WIFI_LORA_32_V3)
+// All 6 confirmed directly on hardware (2026-07-31) -- the derived V2->V3
+// header-position mapping had LED2 wrong (40->39); LED1 and the 4 buttons
+// matched the derivation.
+const int BUTTON1_PIN = 20;  // previous screen
+const int BUTTON2_PIN = 42;  // next screen -- CAVEAT: this is MTMS, a JTAG debug pin
+const int BUTTON3_PIN = 45;  // mute/acknowledge alert -- CAVEAT: S3 boot-strapping pin (flash voltage select)
+const int BUTTON4_PIN = 5;   // spare (logged to Serial only for now)
 
+const int LED1_PIN = 26;  // heartbeat: brief flash on each received packet -- CAVEAT: labeled SPICS1, possibly reserved for PSRAM/flash on some V3 module variants
+const int LED2_PIN = 39;  // alert: solid on when the LoRa link is lost -- CAVEAT: this is MTCK, a JTAG debug pin
+#else
 const int BUTTON1_PIN = 17;  // previous screen
 const int BUTTON2_PIN = 39;  // next screen
 const int BUTTON3_PIN = 38;  // mute/acknowledge alert
@@ -52,6 +138,7 @@ const int BUTTON4_PIN = 12;  // spare (logged to Serial only for now)
 
 const int LED1_PIN = 2;   // heartbeat: brief flash on each received packet
 const int LED2_PIN = 32;  // alert: solid on when the LoRa link is lost
+#endif
 
 // ---------------------------------------------------------------------------------
 
@@ -74,11 +161,6 @@ int currentScreen = SCREEN_LEVEL;
 const char *FAN_PROBE_NAMES[4] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet"};
 
 // simple debounce: pin, and whether it was down last time we checked
-struct DebouncedButton
-{
-  int pin;
-  bool wasDown;
-};
 DebouncedButton buttons[4] = {
     {BUTTON1_PIN, false},
     {BUTTON2_PIN, false},
@@ -92,6 +174,49 @@ DebouncedButton buttons[4] = {
 
 void setup()
 {
+#if defined(WIFI_LORA_32_V3)
+  // Display + Vext + Serial only -- LoRaEnable is false because the radio
+  // is driven directly via RadioLib below instead (see the note above the
+  // V3 LoRa radio section for why Heltec.begin()'s own LoRa init can't be
+  // used here).
+  Heltec.begin(true, false, true, true, LORA_BAND);
+
+  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_NSS_PIN);
+  // Parameters chosen to exactly match Tilt_Temp_AirStream's radio config
+  // (still on V2 -- see LORA_BAND and setSpreadingFactor/etc. in the #else
+  // branch below): 915MHz, 125kHz bandwidth, spreading factor 11, sync
+  // word 0x34, CRC on. Coding rate 5 (4/5) matches what BOTH sketches'
+  // vendored classic LoRa.h libraries actually use today -- neither one
+  // explicitly calls setCodingRate4(), so they've been running at the
+  // SX127x's power-on-reset default of 4/5 this whole time. RadioLib
+  // doesn't share that hardware default (its own default is 4/7), so it
+  // has to be requested explicitly here to match, or the two boards won't
+  // be able to decode each other's packets -- silently, with no error on
+  // either side (this bit us once already, with a different setting).
+  int radioState = radio.begin(LORA_BAND / 1E6, 125.0, 11, 5, 0x34, 17, 8);
+  if (radioState != RADIOLIB_ERR_NONE)
+  {
+    Serial.print("SX1262 radio.begin() failed, code ");
+    Serial.println(radioState);
+  }
+  radio.setCRC(true);
+
+  // Confirmed via byte-for-byte TX/RX comparison: the PHY header decoded
+  // correctly on every packet (right length every time) but the payload
+  // came back as near-total garbage -- LDRO (Low Data Rate Optimization)
+  // changes how the payload specifically gets bit-interleaved, and
+  // classic LoRa.h's setLdoFlag() has an integer-truncation quirk at
+  // SF11/125kHz: symbolDuration = 1000 / (125000 / 2048) truncates to
+  // 1000/61 = 16 (integer division, twice), and the check is strictly
+  // "> 16", so LDRO ends up DISABLED on both Airstream and the V2
+  // TowVehicle. RadioLib's own auto-LDRO uses floating point instead
+  // (2048/125.0 = 16.384 >= 16.0 -> true) and enables it, which corrupts
+  // every payload without touching the header. Force it off to match.
+  radio.forceLDRO(false);
+
+  radio.setDio1Action(onLoraDio1Rise);
+  radio.startReceive();
+#else
   // Heltec.begin(DisplayEnable, LoRaEnable, SerialEnable, PABOOST, BAND) --
   // handles Serial.begin(), Vext power-up, OLED init, and LoRa radio init
   // (SPI + pins) all in one call, using the board package's own pin
@@ -108,15 +233,39 @@ void setup()
   Heltec.LoRa.setSignalBandwidth(125E3);
   Heltec.LoRa.setSyncWord(0x34);
   Heltec.LoRa.enableCrc();
+#endif
 
   Serial.println();
   Serial.println(this_file);
   Serial.println(ver);
 
-  pinMode(BUTTON1_PIN, INPUT_PULLUP);  // GPIO17 supports an internal pull-up
-  pinMode(BUTTON2_PIN, INPUT);         // GPIO39 is input-only, no internal pull-up -- board has an external 10K pull-up (R3)
-  pinMode(BUTTON3_PIN, INPUT);         // GPIO38 is input-only, no internal pull-up -- board has an external 10K pull-up (R4)
-  pinMode(BUTTON4_PIN, INPUT_PULLUP);  // GPIO12 supports an internal pull-up
+  // BUTTON2/BUTTON3 use INPUT (not INPUT_PULLUP) because on the V2 module
+  // those header positions are input-only pins with no internal pull-up --
+  // the PCB has external 10K pull-ups (R3, R4) wired to those specific
+  // header positions instead, regardless of which module is populated. On
+  // V3 those positions land on pins that DO support an internal pull-up,
+  // but INPUT still works fine there since the external resistor is a
+  // fixed PCB component, not something that depends on module choice.
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT);
+  pinMode(BUTTON3_PIN, INPUT);
+  pinMode(BUTTON4_PIN, INPUT_PULLUP);
+
+#if defined(WIFI_LORA_32_V3)
+  // LED2 (GPIO39, confirmed on hardware -- the derived pin table had this
+  // wrong as GPIO40, which is why earlier fix attempts didn't help) glows
+  // dimly even when explicitly driven LOW, regardless of USB connection
+  // state (ruling out the USB-Serial-JTAG peripheral actively driving it --
+  // that would only show up while USB is attached). GPIO39 is MTCK, one of
+  // the ESP32-S3's JTAG pins; gpio_reset_pin() forces the IO mux back to
+  // plain GPIO in case something still has a residual claim on it, and
+  // gpio_set_drive_capability() maxes out the output drive strength in case
+  // the dim glow is a weak-pull-vs-weak-drive fight this pin's default
+  // (weaker) drive strength was losing. BUTTON2 (GPIO42, MTMS) shares this
+  // same class of risk -- revisit if it ever misbehaves the same way.
+  gpio_reset_pin((gpio_num_t)LED2_PIN);
+  gpio_set_drive_capability((gpio_num_t)LED2_PIN, GPIO_DRIVE_CAP_3);
+#endif
   pinMode(LED1_PIN, OUTPUT);
   pinMode(LED2_PIN, OUTPUT);
   digitalWrite(LED1_PIN, LOW);
@@ -147,6 +296,70 @@ void loop()
 
 void receiveLoRaPacket()
 {
+#if defined(WIFI_LORA_32_V3)
+  if (!loraPacketReceivedFlag)
+  {
+    return;  // nothing arrived, not an error -- don't spam Serial
+  }
+  loraPacketReceivedFlag = false;
+
+  size_t packetSize = radio.getPacketLength();
+  if (packetSize != sizeof(rxPacket))
+  {
+    // Something arrived but isn't a valid LoRaPacket -- radio params
+    // mismatched between boards, interference, or a version skew between
+    // the two sketches' LoRaPacket.h. Worth knowing about, unlike the
+    // silent "nothing arrived" case above.
+    Serial.print("RX: got ");
+    Serial.print(packetSize);
+    Serial.print(" bytes, expected ");
+    Serial.println(sizeof(rxPacket));
+    radio.startReceive();
+    return;
+  }
+
+  // RX_DONE (the only IRQ in RadioLib's default receive mask) fires
+  // whenever the radio finishes clocking in a packet-shaped signal --
+  // REGARDLESS of whether its CRC actually validates. readData() checks
+  // CRC internally and returns an error for it, but until now nothing here
+  // checked that return value, so a CRC-failed (corrupted) packet was
+  // silently accepted and displayed as if it were valid. This is very
+  // likely why specific fields (not random ones) were consistently wrong:
+  // LoRa's interleaving/FEC can leave some byte regions of a corrupted
+  // packet closer to correct than others, not a uniform random scramble.
+  int16_t readState = radio.readData((uint8_t *)&rxPacket, sizeof(rxPacket));
+  radio.startReceive();
+
+  // Diagnostic for tracking down the date/time field corruption -- hex
+  // dump of exactly what was received, byte for byte, to compare against
+  // the transmit-side dump, REGARDLESS of whether CRC passed (printed
+  // before the CRC check below returns early, on purpose -- we need to see
+  // the bytes precisely when CRC failed, not just when it didn't). Remove
+  // once resolved.
+  Serial.print("RX raw bytes (");
+  Serial.print(sizeof(rxPacket));
+  Serial.print(", readData() code ");
+  Serial.print(readState);
+  Serial.print("): ");
+  {
+    uint8_t *raw = (uint8_t *)&rxPacket;
+    for (size_t i = 0; i < sizeof(rxPacket); i++)
+    {
+      if (raw[i] < 0x10)
+        Serial.print('0');
+      Serial.print(raw[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
+
+  if (readState != RADIOLIB_ERR_NONE)
+  {
+    Serial.print("RX: readData() failed, code ");
+    Serial.println(readState);
+    return;
+  }
+#else
   int packetSize = Heltec.LoRa.parsePacket();
   if (packetSize == 0)
   {
@@ -166,6 +379,8 @@ void receiveLoRaPacket()
   }
 
   Heltec.LoRa.readBytes((uint8_t *)&rxPacket, sizeof(rxPacket));
+#endif
+
   lastPacketTime = millis();
   alertMuted = false;  // a fresh, valid packet clears any prior mute
 
@@ -317,7 +532,11 @@ void drawScreen()
       Heltec.display->drawString(0, 26, line);
       Heltec.display->drawString(0, 39, isLinkLost() ? "LINK LOST" : "OK");
     }
+#if defined(WIFI_LORA_32_V3)
+    snprintf(line, sizeof(line), "RSSI: %.0f", radio.getRSSI());
+#else
     snprintf(line, sizeof(line), "RSSI: %d", Heltec.LoRa.packetRssi());
+#endif
     Heltec.display->drawString(0, 52, line);
     break;
 

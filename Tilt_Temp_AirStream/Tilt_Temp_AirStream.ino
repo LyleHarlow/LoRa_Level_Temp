@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-26 19:10 PDT
+// Last updated: 2026-07-31 05:45 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -90,8 +90,8 @@ const int TOUCH_CS_PIN = 21;
 // OneWire pull-up (matches the original code's OneWire-based approach on
 // these same physical pins, just swapped between TEMP1/TEMP2).
 const int TEMP1_PIN = 13;  // Fridge
-const int TEMP2_PIN = 25;  // Freezer
-const int TEMP3_PIN = 36;  // Inside Airstream
+const int TEMP2_PIN = 36;  // Freezer
+const int TEMP3_PIN = 25;  // Inside Airstream
 const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter
 // AMBLIGHTSENSE_PIN = 37, disabled -- photoresistor isn't installed yet, and
 // (separately) analogRead() on this pin was crashing the ADC driver anyway.
@@ -826,6 +826,25 @@ void transmitPacket()
   LoRa.beginPacket();
   LoRa.write((uint8_t *)&txPacket, sizeof(txPacket));
   LoRa.endPacket(true);
+
+  // Diagnostic for tracking down the TowVehicle-V3 date/time field
+  // corruption -- hex dump of exactly what's going out over the air, byte
+  // for byte, so it can be compared against what the receiver actually
+  // reads. Remove once that's resolved.
+  Serial.print("TX raw bytes (");
+  Serial.print(sizeof(txPacket));
+  Serial.print("): ");
+  {
+    uint8_t *raw = (uint8_t *)&txPacket;
+    for (size_t i = 0; i < sizeof(txPacket); i++)
+    {
+      if (raw[i] < 0x10)
+        Serial.print('0');
+      Serial.print(raw[i], HEX);
+      Serial.print(' ');
+    }
+    Serial.println();
+  }
 
   Serial.print("TX  pitch=");
   Serial.print(txPacket.pitch, 1);
