@@ -4,7 +4,7 @@
 //      *                                                                *
 //      ******************************************************************
 
-// Last updated: 2026-07-31 05:45 PDT
+// Last updated: 2026-07-31 21:03 PDT
 
 //
 // Heltec WiFi LoRa 32 V2. Reads MPU6050 tilt, 4 DS18B20 (OneWire) temp
@@ -85,14 +85,16 @@ const int LCD_BACKLIGHT_PIN = 12;
 const int TOUCH_CS_PIN = 21;
 // TOUCH_IRQ_PIN (GPIO38) is on the schematic but not currently used by the library
 
-// Sensors. TEMP1-4 are each a DS18B20 (BOJACK 1M stainless probe) on its
-// own OneWire bus, with the schematic's 3.3k resistor acting as the
+// Sensors. TEMP1/TEMP2 are each a DS18B20 (BOJACK 1M stainless probe) on
+// its own OneWire bus, with the schematic's 3.3k resistor acting as the
 // OneWire pull-up (matches the original code's OneWire-based approach on
 // these same physical pins, just swapped between TEMP1/TEMP2).
+// TEMP3 (GPIO36) and TEMP4 (GPIO39) were removed -- both are input-only
+// pins on the ESP32 (no output driver, can't pull the OneWire bus low), so
+// a DS18B20 wired to either one can never work. Confirmed on hardware: the
+// probes worked fine on TEMP1/TEMP2 but not once moved to TEMP3/TEMP4.
 const int TEMP1_PIN = 13;  // Fridge
-const int TEMP2_PIN = 36;  // Freezer
-const int TEMP3_PIN = 25;  // Inside Airstream
-const int TEMP4_PIN = 39;  // DC Electrical Cabinet, battery bank + inverter
+const int TEMP2_PIN = 25;  // DC Cabinet, battery bank + inverter
 // AMBLIGHTSENSE_PIN = 37, disabled -- photoresistor isn't installed yet, and
 // (separately) analogRead() on this pin was crashing the ADC driver anyway.
 // Re-enable once the sensor is physically installed and that's investigated.
@@ -121,15 +123,24 @@ const int OUT2_RELAY_PIN = 32;
 const float PITCH_SIGN = 1.0;
 const float ROLL_SIGN = 1.0;
 
-// Distance (inches) between the trailer's leveling/jack points. Left at 0
-// (disabled -- falls back to showing degrees) until measured for real.
-const float LEVEL_POINT_DISTANCE_INCHES = 0;
+// Distance (inches) between the trailer's leveling points, used to convert
+// tilt angle to how many inches to raise/lower one end -- inches = tan(angle)
+// * distance, valid for a rigid body regardless of where on it the sensor
+// is mounted (the tilt angle is the same everywhere on the frame; only the
+// horizontal distance between the two points being leveled matters). Either
+// can be set to 0 to fall back to showing degrees for that axis.
+//
+// PITCH (nose up/down, front-to-back level): tongue jack to the center of
+// the (dual) axles, 16ft measured on the trailer.
+const float LEVEL_PITCH_DISTANCE_INCHES = 16.0 * 12.0;  // 192 in
+// ROLL (left/right level): trailer width, 8ft measured on the trailer.
+const float LEVEL_ROLL_DISTANCE_INCHES = 8.0 * 12.0;  // 96 in
 
 // EEPROM addresses (see TouchUserInterfaceForArduino's writeConfigurationFloat/Int --
 // each value uses 5 bytes, so keep these at least 5 apart; using 10 for headroom).
 const int EEPROM_ADDR_PITCH_OFFSET = 0;
 const int EEPROM_ADDR_ROLL_OFFSET = 10;
-const int EEPROM_ADDR_FAN_PROBE = 20;        // int: 0=Fridge,1=Freezer,2=Inside AS,3=DC Cabinet
+const int EEPROM_ADDR_FAN_PROBE = 20;        // int: 0=Fridge,1=DC Cabinet
 const int EEPROM_ADDR_FAN_MIN_TEMP = 30;     // float, deg F
 const int EEPROM_ADDR_FAN_MAX_TEMP = 40;     // float, deg F
 const int EEPROM_ADDR_FAN_TIME_ENABLE = 50;  // int: 0=schedule ignored, 1=schedule gates operation
@@ -152,12 +163,8 @@ TouchUserInterfaceForArduino ui;
 
 OneWire oneWireTemp1(TEMP1_PIN);
 OneWire oneWireTemp2(TEMP2_PIN);
-OneWire oneWireTemp3(TEMP3_PIN);
-OneWire oneWireTemp4(TEMP4_PIN);
 DallasTemperature dsTemp1(&oneWireTemp1);
 DallasTemperature dsTemp2(&oneWireTemp2);
-DallasTemperature dsTemp3(&oneWireTemp3);
-DallasTemperature dsTemp4(&oneWireTemp4);
 
 enum TempReadState
 {
@@ -172,6 +179,14 @@ LoRaPacket txPacket;
 float pitchOffset = 0;
 float rollOffset = 0;
 
+// Raw tilt angle in degrees, before the tan()*distance inches conversion --
+// "Zero Level" needs to zero out the actual angle, not the already-converted
+// inches value in txPacket.pitch/roll (a real bug once LEVEL_PITCH/ROLL_
+// DISTANCE_INCHES are set: pitchOffset is subtracted from a degrees value
+// inside updateTilt(), so it must stay in degrees itself).
+float lastPitchDegrees = 0;
+float lastRollDegrees = 0;
+
 // Smoothing averages the raw accelerometer vector (not the derived angles)
 // -- averaging angles directly breaks near the atan2 wraparound point.
 const int TILT_SAMPLE_COUNT = 8;
@@ -185,7 +200,7 @@ const unsigned long TRANSMIT_INTERVAL_MS = 2000;
 
 // Fan control state -- loaded from EEPROM in loadFanSettings(), edited on
 // the Fan Control screen (each control persists immediately on change).
-const char *FAN_PROBE_NAMES[4] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet"};
+const char *FAN_PROBE_NAMES[2] = {"Fridge", "DC Cabinet"};
 int fanProbeIndex = 0;
 float fanMinTemp = 70.0;
 float fanMaxTemp = 90.0;
@@ -467,6 +482,24 @@ void setupTiltSensor()
     mpuOk = mpu.begin(MPU6050_ADDRESS, &Wire);
     if (!mpuOk)
     {
+      // scanI2CBus() above already shows 0x69 ACKs a bare address probe, so
+      // begin() must be failing a deeper check -- almost certainly the
+      // WHO_AM_I register readback it gates on (expects 0x68). Read that
+      // register directly, bypassing Adafruit_MPU6050::begin(), to see
+      // whether it's coming back wrong (real chip, bad data) or not
+      // responding at all to an actual register read (vs. just an empty
+      // address probe).
+      Wire.beginTransmission(MPU6050_ADDRESS);
+      Wire.write(0x75);  // WHO_AM_I
+      uint8_t writeErr = Wire.endTransmission(false);
+      uint8_t whoAmI = 0xFF;
+      if (Wire.requestFrom((uint8_t)MPU6050_ADDRESS, (uint8_t)1) == 1)
+        whoAmI = Wire.read();
+      Serial.print("  WHO_AM_I read: 0x");
+      Serial.print(whoAmI, HEX);
+      Serial.print(" (expect 0x68), endTransmission code ");
+      Serial.println(writeErr);
+
       Serial.print("MPU6050 init attempt ");
       Serial.print(attempt);
       Serial.println(" failed, retrying...");
@@ -513,6 +546,16 @@ void setupRTC()
 
   rtcAvailable = true;
 
+  // Log the raw booleans directly -- found (2026-07-31) that a genuinely
+  // never-set PCF8523 can report initialized()=true, lostPower()=false
+  // (this check's fallback below never fires) while still returning
+  // garbage like month=0/day=0 from now(), so seeing these values directly
+  // matters more than inferring them from which branch ran.
+  Serial.print("RTC initialized()=");
+  Serial.print(rtc.initialized());
+  Serial.print(" lostPower()=");
+  Serial.println(rtc.lostPower());
+
   if (!rtc.initialized() || rtc.lostPower())
   {
     // lostPower() being true on every boot (time set via the Settings
@@ -529,6 +572,19 @@ void setupRTC()
   rtc.start();
 
   DateTime now = rtc.now();
+
+  // Belt-and-suspenders on top of the initialized()/lostPower() check above
+  // -- confirmed on hardware (2026-07-31) that check can miss a genuinely
+  // never-set RTC (month=0/day=0, neither a valid calendar value) on this
+  // module. Catch that case directly and force the same compile-time
+  // fallback rather than letting an obviously-impossible date through.
+  if (now.month() < 1 || now.month() > 12 || now.day() < 1 || now.day() > 31)
+  {
+    Serial.println("RTC returned an impossible date despite initialized()/lostPower() -- forcing compile-time fallback");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    now = rtc.now();
+  }
+
   Serial.print("RTC time: ");
   Serial.print(now.year());
   Serial.print('-');
@@ -547,15 +603,11 @@ void setupTempSensors()
 {
   dsTemp1.begin();
   dsTemp2.begin();
-  dsTemp3.begin();
-  dsTemp4.begin();
 
   // non-blocking mode: requestTemperatures() returns immediately, we poll
   // for the result ourselves after TEMP_CONVERSION_TIME_MS (see updateTemperatures)
   dsTemp1.setWaitForConversion(false);
   dsTemp2.setWaitForConversion(false);
-  dsTemp3.setWaitForConversion(false);
-  dsTemp4.setWaitForConversion(false);
 }
 
 // TouchUserInterfaceForArduino's ESP32 writeConfigurationInt/Float
@@ -583,6 +635,10 @@ void flushEepromToFlash()
 void loadFanSettings()
 {
   fanProbeIndex = ui.readConfigurationInt(EEPROM_ADDR_FAN_PROBE, 0);
+  // Clamp in case a board still has 2 (Inside AS) or 3 (DC Cabinet) stored
+  // from before those probes were removed.
+  if (fanProbeIndex < 0 || fanProbeIndex > 1)
+    fanProbeIndex = 0;
   fanMinTemp = ui.readConfigurationFloat(EEPROM_ADDR_FAN_MIN_TEMP, 70.0);
   fanMaxTemp = ui.readConfigurationFloat(EEPROM_ADDR_FAN_MAX_TEMP, 90.0);
   fanTimeEnabled = ui.readConfigurationInt(EEPROM_ADDR_FAN_TIME_ENABLE, 0);
@@ -658,17 +714,15 @@ void updateTilt()
   // after the offset so the UI always shows a believable tilt value.
   float pitchDegrees = normalizeAngle180(PITCH_SIGN * PITCH_FROM_AXES(axAvg, ayAvg, azAvg) - pitchOffset);
   float rollDegrees = normalizeAngle180(ROLL_SIGN * ROLL_FROM_AXES(axAvg, ayAvg, azAvg) - rollOffset);
+  lastPitchDegrees = pitchDegrees;
+  lastRollDegrees = rollDegrees;
 
-  if (LEVEL_POINT_DISTANCE_INCHES > 0)
-  {
-    txPacket.pitch = tan(pitchDegrees * PI / 180.0) * LEVEL_POINT_DISTANCE_INCHES;
-    txPacket.roll = tan(rollDegrees * PI / 180.0) * LEVEL_POINT_DISTANCE_INCHES;
-  }
-  else
-  {
-    txPacket.pitch = pitchDegrees;
-    txPacket.roll = rollDegrees;
-  }
+  txPacket.pitch = (LEVEL_PITCH_DISTANCE_INCHES > 0)
+    ? tan(pitchDegrees * PI / 180.0) * LEVEL_PITCH_DISTANCE_INCHES
+    : pitchDegrees;
+  txPacket.roll = (LEVEL_ROLL_DISTANCE_INCHES > 0)
+    ? tan(rollDegrees * PI / 180.0) * LEVEL_ROLL_DISTANCE_INCHES
+    : rollDegrees;
 }
 
 // ---------------------------------------------------------------------------------
@@ -685,7 +739,7 @@ float readDS18B20(DallasTemperature &sensor)
   return f;
 }
 
-// Non-blocking: kicks off a conversion on all 4 probes every
+// Non-blocking: kicks off a conversion on both probes every
 // TEMP_UPDATE_INTERVAL_MS, then collects the results once conversion time
 // has elapsed. Does not delay() -- safe to call every loop iteration.
 void updateTemperatures()
@@ -696,8 +750,6 @@ void updateTemperatures()
   {
     dsTemp1.requestTemperatures();
     dsTemp2.requestTemperatures();
-    dsTemp3.requestTemperatures();
-    dsTemp4.requestTemperatures();
     tempConversionStartTime = now;
     tempReadState = TEMP_CONVERTING;
   }
@@ -705,8 +757,6 @@ void updateTemperatures()
   {
     txPacket.temp1 = readDS18B20(dsTemp1);
     txPacket.temp2 = readDS18B20(dsTemp2);
-    txPacket.temp3 = readDS18B20(dsTemp3);
-    txPacket.temp4 = readDS18B20(dsTemp4);
     lastTempUpdateTime = now;
     tempReadState = TEMP_IDLE;
   }
@@ -718,17 +768,7 @@ void updateTemperatures()
 
 float getFanProbeTemp()
 {
-  switch (fanProbeIndex)
-  {
-  case 0:
-    return txPacket.temp1;
-  case 1:
-    return txPacket.temp2;
-  case 2:
-    return txPacket.temp3;
-  default:
-    return txPacket.temp4;
-  }
+  return (fanProbeIndex == 0) ? txPacket.temp1 : txPacket.temp2;
 }
 
 // Hysteresis thermostat (on above max, off below min, unchanged in
@@ -854,10 +894,6 @@ void transmitPacket()
   Serial.print(txPacket.temp1, 1);
   Serial.print("  t2=");
   Serial.print(txPacket.temp2, 1);
-  Serial.print("  t3=");
-  Serial.print(txPacket.temp3, 1);
-  Serial.print("  t4=");
-  Serial.print(txPacket.temp4, 1);
   Serial.print("  fan=");
   Serial.print(fanOn ? "ON" : "OFF");
 
@@ -940,11 +976,11 @@ int hour24From12AndAmPm(int hour12, int ampm)
 }
 
 // Formats a signed tilt value as a direction word + magnitude, e.g.
-// "Nose High 2.3 deg" instead of a signed number -- easier to act on at a
-// glance. Unit switches to inches once LEVEL_POINT_DISTANCE_INCHES is set.
-void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *positiveLabel, const char *negativeLabel)
+// "Nose High 2.3 in" instead of a signed number -- easier to act on at a
+// glance. unit is "in" or "deg" depending on whether the caller's axis has
+// its LEVEL_PITCH/ROLL_DISTANCE_INCHES set (see updateTilt()).
+void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *positiveLabel, const char *negativeLabel, const char *unit)
 {
-  const char *unit = (LEVEL_POINT_DISTANCE_INCHES > 0) ? "in" : "deg";
   const char *direction = (value >= 0) ? positiveLabel : negativeLabel;
   float magnitude = (value >= 0) ? value : -value;
   snprintf(buf, bufSize, "%s %.1f %s", direction, magnitude, unit);
@@ -1040,11 +1076,13 @@ void commandLevel(void)
     }
 
     char buf[24];
-    formatDirectionalValue(buf, sizeof(buf), txPacket.pitch, "Nose High", "Nose Low");
+    formatDirectionalValue(buf, sizeof(buf), txPacket.pitch, "Nose High", "Nose Low",
+      (LEVEL_PITCH_DISTANCE_INCHES > 0) ? "in" : "deg");
     drawInfoValue(0, buf);
     // Roll sign here describes the LOW side, since that's the one that
     // needs a block/shim under it -- you can't lower the high side.
-    formatDirectionalValue(buf, sizeof(buf), txPacket.roll, "Right Low", "Left Low");
+    formatDirectionalValue(buf, sizeof(buf), txPacket.roll, "Right Low", "Left Low",
+      (LEVEL_ROLL_DISTANCE_INCHES > 0) ? "in" : "deg");
     drawInfoValue(1, buf);
     formatDateTime(buf, sizeof(buf));
     drawInfoValue(2, buf);
@@ -1062,12 +1100,10 @@ void commandTemps(void)
   ui.drawTitleBarWithBackButton("Temperatures");
   ui.clearDisplaySpace(LCD_BLUE);
 
-  // 5 rows here vs. 3 on the Level screen -- still room to grow from the
-  // original small font, just not as large.
   ui.lcdSetFont(UI_Font_16_Bold);
   ui.lcdSetFontColor(LCD_WHITE);
-  const char *labels[] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet", "Date/Time"};
-  drawInfoLabels(labels, 5, ui.displaySpaceHeight / 5);
+  const char *labels[] = {"Fridge", "DC Cabinet", "Date/Time"};
+  drawInfoLabels(labels, 3, ui.displaySpaceHeight / 3);
 
   while (true)
   {
@@ -1081,12 +1117,8 @@ void commandTemps(void)
     drawInfoValue(0, buf);
     snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp2);
     drawInfoValue(1, buf);
-    snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp3);
-    drawInfoValue(2, buf);
-    snprintf(buf, sizeof(buf), "%.1f F", txPacket.temp4);
-    drawInfoValue(3, buf);
     formatDateTime(buf, sizeof(buf));
-    drawInfoValue(4, buf);
+    drawInfoValue(2, buf);
 
     delay(50);
   }
@@ -1129,10 +1161,9 @@ void drawSelectionBoxHighlight(SELECTION_BOX &box, int numberOfCells)
 
 // 4 rows: Schedule (full width, only 2 choices so it fits fine inline),
 // then Probe link, then the two range/hours link buttons. Probe is its own
-// screen (see commandFanProbe() below) because a 4-choice SELECTION_BOX
-// with labels like "Inside AS"/"DC Cabinet" doesn't fit legibly in one row
-// even at full screen width -- lcdPrintCentered() doesn't truncate, so long
-// labels just overlap into neighboring cells.
+// screen (see commandFanProbe() below) rather than an inline SELECTION_BOX
+// here, left as-is from when there were 4 probe choices (now just Fridge/
+// DC Cabinet, but the dedicated screen still works fine).
 void layoutFanControlWidgets()
 {
   // drawSelectionBox() draws the label ABOVE the box itself (see
@@ -1255,18 +1286,19 @@ void commandFanControl(void)
 //                       Screen 3a: Fan Control -- Probe
 // ---------------------------------------------------------------------------------
 //
-// 4 full-width stacked buttons instead of a single-row SELECTION_BOX -- see
-// the note above layoutFanControlWidgets() for why. drawButton()'s
-// buttonSelectedFlg draws the currently-selected probe highlighted.
+// 2 full-width stacked buttons instead of a single-row SELECTION_BOX -- see
+// the note above layoutFanControlWidgets() for why (this predates temp3/4
+// removal, back when there were 4 probe choices; kept as its own screen
+// rather than folded back into an inline selector since 2 stacked buttons
+// still reads fine). drawButton()'s buttonSelectedFlg draws the currently-
+// selected probe highlighted.
 
 BUTTON fanProbeButton0 = {"Fridge", 0, 0, 0, 0};
-BUTTON fanProbeButton1 = {"Freezer", 0, 0, 0, 0};
-BUTTON fanProbeButton2 = {"Inside AS", 0, 0, 0, 0};
-BUTTON fanProbeButton3 = {"DC Cabinet", 0, 0, 0, 0};
+BUTTON fanProbeButton1 = {"DC Cabinet", 0, 0, 0, 0};
 
 void layoutFanProbeWidgets()
 {
-  int rowHeight = ui.displaySpaceHeight / 4;
+  int rowHeight = ui.displaySpaceHeight / 2;
   int centerX = ui.displaySpaceLeftX + ui.displaySpaceWidth / 2;
   int widgetWidth = ui.displaySpaceWidth - 40;
   int widgetHeight = rowHeight - 20;
@@ -1280,16 +1312,6 @@ void layoutFanProbeWidgets()
   fanProbeButton1.centerY = ui.displaySpaceTopY + rowHeight + rowHeight / 2;
   fanProbeButton1.width = widgetWidth;
   fanProbeButton1.height = widgetHeight;
-
-  fanProbeButton2.centerX = centerX;
-  fanProbeButton2.centerY = ui.displaySpaceTopY + 2 * rowHeight + rowHeight / 2;
-  fanProbeButton2.width = widgetWidth;
-  fanProbeButton2.height = widgetHeight;
-
-  fanProbeButton3.centerX = centerX;
-  fanProbeButton3.centerY = ui.displaySpaceTopY + 3 * rowHeight + rowHeight / 2;
-  fanProbeButton3.width = widgetWidth;
-  fanProbeButton3.height = widgetHeight;
 }
 
 // The 2-arg drawButton(BUTTON&, selectedFlg) overload that would normally
@@ -1299,16 +1321,8 @@ void drawFanProbeButtons()
 {
   ui.drawButton(fanProbeButton0);
   ui.drawButton(fanProbeButton1);
-  ui.drawButton(fanProbeButton2);
-  ui.drawButton(fanProbeButton3);
 
-  BUTTON *selected = &fanProbeButton0;
-  if (fanProbeIndex == 1)
-    selected = &fanProbeButton1;
-  else if (fanProbeIndex == 2)
-    selected = &fanProbeButton2;
-  else if (fanProbeIndex == 3)
-    selected = &fanProbeButton3;
+  BUTTON *selected = (fanProbeIndex == 1) ? &fanProbeButton1 : &fanProbeButton0;
 
   int x1 = selected->centerX - selected->width / 2;
   int y1 = selected->centerY - selected->height / 2;
@@ -1334,8 +1348,6 @@ void commandFanProbe(void)
     int newIndex = -1;
     if (ui.checkForButtonClicked(fanProbeButton0)) newIndex = 0;
     if (ui.checkForButtonClicked(fanProbeButton1)) newIndex = 1;
-    if (ui.checkForButtonClicked(fanProbeButton2)) newIndex = 2;
-    if (ui.checkForButtonClicked(fanProbeButton3)) newIndex = 3;
 
     if (newIndex >= 0 && newIndex != fanProbeIndex)
     {
@@ -1576,8 +1588,12 @@ void commandSettings(void)
 
     if (ui.checkForButtonClicked(zeroLevelButton))
     {
-      pitchOffset += txPacket.pitch;
-      rollOffset += txPacket.roll;
+      // Must use the raw pre-conversion degree values here, not
+      // txPacket.pitch/roll -- those are in inches once LEVEL_PITCH/ROLL_
+      // DISTANCE_INCHES are set, but pitchOffset/rollOffset are subtracted
+      // from a degrees value inside updateTilt().
+      pitchOffset += lastPitchDegrees;
+      rollOffset += lastRollDegrees;
       ui.writeConfigurationFloat(EEPROM_ADDR_PITCH_OFFSET, pitchOffset);
       ui.writeConfigurationFloat(EEPROM_ADDR_ROLL_OFFSET, rollOffset);
       flushEepromToFlash();

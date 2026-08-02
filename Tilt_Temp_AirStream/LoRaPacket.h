@@ -8,12 +8,14 @@
 
 struct LoRaPacket
 {
-  float pitch;  // nose up(+)/down(-); degrees, or inches once LEVEL_POINT_DISTANCE_INCHES is set; zero-offset already applied
-  float roll;   // left up(+)/down(-); same units/offset handling as pitch
+  float pitch;  // nose up(+)/down(-); degrees, or inches once LEVEL_PITCH_DISTANCE_INCHES is set; zero-offset already applied
+  float roll;   // left up(+)/down(-); degrees, or inches once LEVEL_ROLL_DISTANCE_INCHES is set; zero-offset already applied
   float temp1;  // Fridge, deg F
-  float temp2;  // Freezer, deg F
-  float temp3;  // Inside Airstream, deg F
-  float temp4;  // DC Electrical Cabinet (battery bank + inverter), deg F
+  float temp2;  // DC Cabinet (battery bank + inverter), deg F
+  // temp3 (Inside Airstream)/temp4 (DC Electrical Cabinet) removed -- those
+  // probes were wired to GPIO36/39 on the Airstream's ESP32, which are
+  // input-only pins that can't drive the OneWire bus low, so they could
+  // never actually work.
 
   // RTC date/time from the Airstream board -- all 0 if its RTC isn't
   // available. hour is 24-hour; TowVehicle converts to 12-hour+AM/PM for
@@ -26,7 +28,7 @@ struct LoRaPacket
 
   // Fan control status, mirrors the Airstream's Fan Control screens.
   int fanOn;          // 0/1
-  int fanProbeIndex;  // 0=Fridge, 1=Freezer, 2=Inside AS, 3=DC Cabinet
+  int fanProbeIndex;  // 0=Fridge, 1=DC Cabinet
   float fanOffTemp;   // deg F -- fan turns off at/below this
   float fanOnTemp;    // deg F -- fan turns on at/above this
   int fanStartHour;   // 24-hour

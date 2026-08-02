@@ -158,7 +158,7 @@ enum Screen
 int currentScreen = SCREEN_LEVEL;
 
 // Matches Airstream's Fan Control probe order (EEPROM_ADDR_FAN_PROBE).
-const char *FAN_PROBE_NAMES[4] = {"Fridge", "Freezer", "Inside AS", "DC Cabinet"};
+const char *FAN_PROBE_NAMES[2] = {"Fridge", "DC Cabinet"};
 
 // simple debounce: pin, and whether it was down last time we checked
 DebouncedButton buttons[4] = {
@@ -391,11 +391,7 @@ void receiveLoRaPacket()
   Serial.print("  t1=");
   Serial.print(rxPacket.temp1, 1);
   Serial.print("  t2=");
-  Serial.print(rxPacket.temp2, 1);
-  Serial.print("  t3=");
-  Serial.print(rxPacket.temp3, 1);
-  Serial.print("  t4=");
-  Serial.println(rxPacket.temp4, 1);
+  Serial.println(rxPacket.temp2, 1);
 
   digitalWrite(LED1_PIN, HIGH);
   delay(30);
@@ -451,16 +447,17 @@ void handleButtons()
 // ---------------------------------------------------------------------------------
 
 // Formats a signed tilt value as a direction word + magnitude, e.g.
-// "Nose High 2.3 deg" instead of a signed number -- matches
-// Tilt_Temp_AirStream's touchscreen wording. Unit is hardcoded to degrees
-// for now since rxPacket doesn't carry which unit Airstream used -- when
-// Airstream's LEVEL_POINT_DISTANCE_INCHES gets set to switch to inches,
-// this needs updating too (or LoRaPacket needs a unit flag added).
+// "Nose High 2.3 in" instead of a signed number -- matches
+// Tilt_Temp_AirStream's touchscreen wording. Unit is hardcoded to inches
+// since rxPacket doesn't carry which unit Airstream used, and Airstream's
+// LEVEL_PITCH_DISTANCE_INCHES/LEVEL_ROLL_DISTANCE_INCHES are both set now
+// -- if either goes back to 0 (degrees) on the Airstream side, this needs
+// updating too (or LoRaPacket needs a unit flag added).
 void formatDirectionalValue(char *buf, size_t bufSize, float value, const char *positiveLabel, const char *negativeLabel)
 {
   const char *direction = (value >= 0) ? positiveLabel : negativeLabel;
   float magnitude = (value >= 0) ? value : -value;
-  snprintf(buf, bufSize, "%s %.1f deg", direction, magnitude);
+  snprintf(buf, bufSize, "%s %.1f in", direction, magnitude);
 }
 
 // Compact "8AM"/"11PM"-style hour, matching the Airstream's 12-hour Set
@@ -502,12 +499,8 @@ void drawScreen()
     Heltec.display->drawString(0, 0, "Temps (F)");
     snprintf(line, sizeof(line), "Fridge  %.1f", rxPacket.temp1);
     Heltec.display->drawString(0, 14, line);
-    snprintf(line, sizeof(line), "Freezer %.1f", rxPacket.temp2);
+    snprintf(line, sizeof(line), "DC Cab  %.1f", rxPacket.temp2);
     Heltec.display->drawString(0, 27, line);
-    snprintf(line, sizeof(line), "Inside  %.1f", rxPacket.temp3);
-    Heltec.display->drawString(0, 40, line);
-    snprintf(line, sizeof(line), "DC Cab  %.1f", rxPacket.temp4);
-    Heltec.display->drawString(0, 53, line);
     break;
 
   case SCREEN_LINK:
@@ -545,7 +538,7 @@ void drawScreen()
     Heltec.display->drawString(0, 0, "Fan Control");
     Heltec.display->drawString(0, 13, rxPacket.fanOn ? "Fan: ON" : "Fan: OFF");
     int probeIndex = rxPacket.fanProbeIndex;
-    if (probeIndex < 0 || probeIndex > 3)
+    if (probeIndex < 0 || probeIndex > 1)
       probeIndex = 0;
     snprintf(line, sizeof(line), "Probe: %s", FAN_PROBE_NAMES[probeIndex]);
     Heltec.display->drawString(0, 26, line);
